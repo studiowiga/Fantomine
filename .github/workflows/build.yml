@@ -1,0 +1,39 @@
+name: Build Fantomine VST3
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  windows:
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v5
+      - name: Configure
+        run: cmake -B build -G "Visual Studio 17 2022" -A x64
+      - name: Build
+        run: cmake --build build --config Release --parallel
+      - name: Upload VST3 (Windows)
+        uses: actions/upload-artifact@v4
+        with:
+          name: Fantomine-VST3-Windows
+          path: build/Fantomine_artefacts/Release/VST3/Fantomine.vst3
+
+  macos:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v5
+      - name: Configure (universel arm64 + x86_64)
+        run: cmake -B build -DCMAKE_BUILD_TYPE=Release -DCMAKE_OSX_ARCHITECTURES="arm64;x86_64"
+      - name: Build
+        run: cmake --build build --config Release --parallel
+      - name: Signature ad hoc (necessaire sur Apple Silicon)
+        run: codesign --force --deep --sign - build/Fantomine_artefacts/Release/VST3/Fantomine.vst3
+      - name: Zip (conserve la structure du bundle)
+        run: cd build/Fantomine_artefacts/Release/VST3 && ditto -c -k --keepParent Fantomine.vst3 $GITHUB_WORKSPACE/Fantomine-VST3-macOS.zip
+      - name: Upload VST3 (macOS)
+        uses: actions/upload-artifact@v4
+        with:
+          name: Fantomine-VST3-macOS
+          path: Fantomine-VST3-macOS.zip
