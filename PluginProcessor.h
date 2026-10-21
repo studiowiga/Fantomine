@@ -57,10 +57,19 @@ public:
     juce::String getCurrentPresetName() const { return currentPresetName; }
     std::atomic<bool> presetDirty { false };   // un potard a bougé depuis le chargement
 
-    // MIDI : pédale d'expression et footswitch
-    std::atomic<int>  expressionCC { 11 };     // CC 11 = Expression (standard)
+    // MIDI : pédales d'expression (une par cible) et footswitch
+    enum MidiTarget { kPitch = 0, kOctave, kVibrato, kSpeed, kBlend, kNumTargets };
+    static const char* getTargetName (int t);
+    void assignCC (int target, int cc);          // target 0..4 ou kLearnFootswitch ; retire ce CC des autres cibles
+    static float shapePedal (float e, bool bipolar);
+    std::array<std::atomic<int>, kNumTargets> targetCC { { { 11 }, { -1 }, { -1 }, { -1 }, { -1 } } };  // -1 = non assigné
     std::atomic<int>  footswitchCC { -1 };     // -1 = non assigné (utiliser le MIDI learn du DAW)
-    std::atomic<int>  learnTarget  { 0 };      // 0 = rien, 1 = pédale, 2 = footswitch
+    static constexpr int kLearnFootswitch = 100;
+    std::atomic<int>  learnTarget  { -1 };     // -1 = rien, 0..4 = cible, kLearnFootswitch = footswitch
+
+    // octave pilotée en continu par une pédale (façon Whammy)
+    std::atomic<bool>  whammyActive { false };
+    std::atomic<float> uiOctave { 0.0f };      // décalage réel en octaves (-1..+1) pour le levier
     std::atomic<float> midiActivity { 0.0f };  // clignotement "MIDI" sur l'afficheur
     std::atomic<int>   lastCCSeen { -1 };
 
@@ -96,6 +105,7 @@ private:
     std::atomic<float>* pSpeed = nullptr; std::atomic<float>* pBlend = nullptr;
     std::atomic<float>* pOctave = nullptr; std::atomic<float>* pPedalMode = nullptr;
     std::atomic<float>* pBypass = nullptr; std::atomic<float>* pHold = nullptr;
+    std::atomic<float>* pWhammy = nullptr; std::atomic<float>* pWhammyRange = nullptr;
 
     // la pédale peut venir du paramètre (automation / MIDI learn du DAW) ou du CC direct
     std::atomic<float> expressionValue { 0.0f };

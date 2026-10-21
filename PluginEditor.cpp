@@ -14,7 +14,8 @@ namespace
     const juce::Point<int>     kTitlePos { 49, 64 };
     const juce::Point<int>     kLedPos   { 573, 545 };
     const juce::Rectangle<int> kOctave  { 100, 755, 300, 85 };
-    const juce::Point<int>     kHandlePos { 117, 9 };       // dans kOctave, position « 0 »
+    const juce::Point<float>   kHandlePos { 105.19f, 1.76f };   // dans kOctave, position « 0 »
+    constexpr float kHandleScale = 1240.0f / 1680.0f;          // sprite en résolution d'origine du design
     constexpr float kHandleTravel = 66.0f;
     const juce::Point<float>   kFootC   { 620.0f, 804.0f };
 
@@ -116,8 +117,8 @@ void PedalKnob::paint (juce::Graphics& g)
 }
 
 //==============================================================================
-OctaveSwitch::OctaveSwitch (juce::RangedAudioParameter& p, const juce::Image& h)
-    : attachment (p, [this] (float v)
+OctaveSwitch::OctaveSwitch (FantomineAudioProcessor& pr, juce::RangedAudioParameter& p, const juce::Image& h)
+    : proc (pr), attachment (p, [this] (float v)
       {
           position = juce::jlimit (0, 2, juce::roundToInt (v));
           if (onChange) onChange();
@@ -132,14 +133,22 @@ OctaveSwitch::OctaveSwitch (juce::RangedAudioParameter& p, const juce::Image& h)
 
 void OctaveSwitch::paint (juce::Graphics& g)
 {
+    // dessin en sous-pixel, à partir du sprite pleine résolution : net à toutes les tailles de fenêtre
     const float dx = (anim - 1.0f) * kHandleTravel;
-    g.drawImageAt (handle, juce::roundToInt ((float) kHandlePos.x + dx), kHandlePos.y);
+    g.setImageResamplingQuality (juce::Graphics::highResamplingQuality);
+    g.drawImageTransformed (handle, juce::AffineTransform::scale (kHandleScale)
+                                        .translated (kHandlePos.x + dx, kHandlePos.y));
 }
 
 void OctaveSwitch::setFromX (float x)
 {
-    const float c = (float) kHandlePos.x + (float) handle.getWidth() * 0.5f;
+    const float c = kHandlePos.x + (float) handle.getWidth() * kHandleScale * 0.5f;
     const int pos = x < c - kHandleTravel * 0.5f ? 0 : (x > c + kHandleTravel * 0.5f ? 2 : 1);
+    if (proc.whammyActive.load())
+    {
+        proc.whammyActive.store (false);          // le levier reprend la main sur la pédale
+        if (pos == position && onChange) onChange();
+    }
     if (pos != position) attachment.setValueAsCompleteGesture ((float) pos);
 }
 
@@ -297,7 +306,7 @@ void GhostDisplay::paint (juce::Graphics& g)
         g.setColour (kViolet.withAlpha (on));
         g.drawText ("HOLD", juce::Rectangle<float> (300.0f, 136.0f, 100.0f, 18.0f), juce::Justification::centredRight);
     }
-    if (proc.learnTarget.load() != 0)
+    if (proc.learnTarget.load() >= 0)
     {
         g.setColour (kViolet.withAlpha (on));
         g.drawText ("LEARN", juce::Rectangle<float> (300.0f, 136.0f, 100.0f, 18.0f), juce::Justification::centredRight);
@@ -429,7 +438,7 @@ PedalView::PedalView (FantomineAudioProcessor& p)
         k->addListener (this);
     }
 
-    octave = std::make_unique<OctaveSwitch> (*p.apvts.getParameter ("octave"), octHandle);
+    octave = std::make_unique<OctaveSwitch> (p, *p.apvts.getParameter ("octave"), octHandle);
     addAndMakeVisible (*octave);
     octave->setBounds (kOctave);
     octave->onChange = [this]
@@ -469,6 +478,7 @@ void PedalView::sliderDragStarted (juce::Slider* s) { sliderValueChanged (s); }
 
 void PedalView::paint (juce::Graphics& g)
 {
+    g.setImageResamplingQuality (juce::Graphics::highResamplingQuality);
     g.drawImageAt (background, 0, 0);
 
     // néon du titre
@@ -496,8 +506,9 @@ void PedalView::paintOverChildren (juce::Graphics& g)
     {
         txt = isBypassed (proc) ? juce::String ("BYPASS")
                                 : (isHold (proc) ? juce::String ("HOLD  -  tap to release") : proc.getCurrentPresetName());
-        if (proc.learnTarget.load() == 1) txt = "LEARN: move your expression pedal";
-        if (proc.learnTarget.load() == 2) txt = "LEARN: press your MIDI footswitch";
+        const int lt = proc.learnTarget.load();
+        if (lt == FantomineAudioProcessor::kLearnFootswitch) txt = "LEARN: press your MIDI footswitch";
+        else if (lt >= 0) txt = "LEARN " + juce::String (FantomineAudioProcessor::getTargetName (lt)) + ": move the pedal";
     }
     g.setColour (juce::Colour (0xffd8dae4).withAlpha (isBypassed (proc) ? 0.55f : 0.95f));
     g.setFont (uiFont (18.5f));
@@ -544,12 +555,18 @@ void PedalView::tick (float dt)
         footswitch.pressAnim += (press - footswitch.pressAnim) * juce::jmin (1.0f, dt * 30.0f);
         footswitch.repaint();
     }
-    const float op = (float) octave->position;
+    // levier : 3 positions, ou suivi continu quand une pédale le pilote (whammy)
+    const bool whammy = proc.whammyActive.load();
+    const float oct = proc.uiOctave.load();
+    const float op = whammy ? juce::jlimit (0.0f, 2.0f, oct + 1.0f) : (float) octave->position;
     if (std::abs (op - octave->anim) > 0.001f)
     {
-        octave->anim += (op - octave->anim) * juce::jmin (1.0f, dt * 22.0f);
+        octave->anim += (op - octave->anim) * juce::jmin (1.0f, dt * (whammy ? 30.0f : 22.0f));
         octave->repaint();
     }
+    if (whammy && std::abs (oct - lastOct) > 0.004f)
+        setStatus ("OCTAVE  " + juce::String (oct >= 0 ? "+" : "") + juce::String (oct * 12.0f, 1) + " st");
+    lastOct = oct;
 
     // les potards ne se redessinent que pendant un fondu
     if (std::abs (lastPower - lights.power) > 0.0005f)
@@ -565,33 +582,65 @@ void PedalView::tick (float dt)
 
 void PedalView::mouseDown (const juce::MouseEvent& e)
 {
-    if (e.mods.isPopupMenu()) showContextMenu();
+    if (! e.mods.isPopupMenu()) return;
+    // clic droit sur un contrôle pilotable : son MIDI Learn apparaît en tête du menu
+    int focus = -1;
+    const auto* src = e.originalComponent;
+    if (src == &vibrato) focus = FantomineAudioProcessor::kVibrato;
+    else if (src == &speed) focus = FantomineAudioProcessor::kSpeed;
+    else if (src == &blend) focus = FantomineAudioProcessor::kBlend;
+    else if (src == octave.get()) focus = FantomineAudioProcessor::kOctave;
+    else if (src == &display) focus = FantomineAudioProcessor::kPitch;
+    showContextMenu (focus);
 }
 
-void PedalView::showContextMenu()
+void PedalView::showContextMenu (int focus)
 {
-    juce::PopupMenu m, size, exp, foot, mode;
-    const int cur = getSizeIndex ? getSizeIndex() : -1;
-    size.addItem (104, "67 % (default)", true, cur < 0);
-    size.addItem (102, "75 %",  true, cur == 1);
-    size.addItem (103, "100 %", true, cur == 2);
-    m.addSubMenu ("Plugin size", size);
+    using P = FantomineAudioProcessor;
+    juce::PopupMenu m, size, pedals, foot, mode, wrange;
 
-    const int ecc = proc.expressionCC.load();
-    exp.addItem (10, "MIDI Learn (move the pedal)");
-    exp.addSeparator();
+    auto ccText = [] (int cc) { return cc < 0 ? juce::String ("not assigned") : "CC " + juce::String (cc); };
+
+    if (focus >= 0)
+    {
+        const int cc = proc.targetCC[(size_t) focus].load();
+        m.addSectionHeader (juce::String (P::getTargetName (focus)) + "  -  " + ccText (cc));
+        m.addItem (1000 + focus * 10, "MIDI Learn: move the expression pedal");
+        if (cc >= 0) m.addItem (1001 + focus * 10, "Clear MIDI assignment");
+        m.addSeparator();
+    }
+
+    // une entrée par cible : Learn / Clear (+ CC courants pour la hauteur)
     static const int ccs[] = { 11, 4, 7, 1, 2 };
     const char* ccNames[] = { "CC 11 - Expression", "CC 4 - Foot Controller", "CC 7 - Volume", "CC 1 - Modulation", "CC 2 - Breath" };
-    for (int i = 0; i < 5; ++i) exp.addItem (11 + i, ccNames[i], true, ecc == ccs[i]);
-    if (std::find (std::begin (ccs), std::end (ccs), ecc) == std::end (ccs))
-        exp.addItem (19, "CC " + juce::String (ecc) + " (learned)", true, true);
-    m.addSubMenu ("Expression pedal (MIDI)", exp);
+    for (int t = 0; t < P::kNumTargets; ++t)
+    {
+        juce::PopupMenu sub;
+        const int cc = proc.targetCC[(size_t) t].load();
+        sub.addItem (1000 + t * 10, "MIDI Learn");
+        sub.addItem (1001 + t * 10, "Clear", cc >= 0);
+        if (t == P::kPitch)
+        {
+            sub.addSeparator();
+            for (int i = 0; i < 5; ++i) sub.addItem (1002 + i, ccNames[i], true, cc == ccs[i]);
+        }
+        const juce::String label = t == P::kPitch  ? "PITCH (bend)"
+                                 : t == P::kOctave ? "OCTAVE (whammy)" : juce::String (P::getTargetName (t));
+        pedals.addSubMenu (label + "   " + ccText (cc), sub);
+    }
+    m.addSubMenu ("Expression pedals (MIDI)", pedals);
+
+    const int wr = juce::roundToInt (proc.apvts.getRawParameterValue ("whammyRange")->load());
+    wrange.addItem (41, "Heel -1 oct  >  centre 0  >  toe +1 oct", true, wr == 0);
+    wrange.addItem (42, "Heel 0  >  toe +1 oct", true, wr == 1);
+    wrange.addItem (43, "Heel 0  >  toe -1 oct", true, wr == 2);
+    m.addSubMenu ("Octave whammy range", wrange);
 
     const int pm = juce::roundToInt (proc.apvts.getRawParameterValue ("pedalMode")->load());
     mode.addItem (21, "UP: heel = played note, toe = + Range", true, pm == 0);
     mode.addItem (22, "DOWN: heel = played note, toe = - Range", true, pm == 1);
     mode.addItem (23, "BIPOLAR: centre = played note", true, pm == 2);
-    m.addSubMenu ("Pedal direction", mode);
+    m.addSubMenu ("Pitch pedal direction", mode);
 
     const int fcc = proc.footswitchCC.load();
     foot.addItem (30, "MIDI Learn (press the footswitch)");
@@ -601,22 +650,37 @@ void PedalView::showContextMenu()
     if (fcc >= 0 && fcc != 64 && fcc != 80) foot.addItem (34, "CC " + juce::String (fcc) + " (learned)", true, true);
     m.addSubMenu ("Footswitch (MIDI)", foot);
 
+    const int cur = getSizeIndex ? getSizeIndex() : -1;
+    size.addItem (104, "67 % (default)", true, cur < 0);
+    size.addItem (102, "75 %",  true, cur == 1);
+    size.addItem (103, "100 %", true, cur == 2);
+    m.addSeparator();
+    m.addSubMenu ("Plugin size", size);
+
     juce::Component::SafePointer<PedalView> safe (this);
     m.showMenuAsync (juce::PopupMenu::Options(), [safe] (int r)
     {
         if (safe == nullptr || r == 0) return;
         auto& p = safe->proc;
-        if (r >= 102 && r <= 104)        { if (safe->onSizeRequest) safe->onSizeRequest (r == 104 ? -1 : r - 101); }
-        else if (r == 10)                { p.learnTarget.store (1); }
-        else if (r >= 11 && r <= 15)     { p.expressionCC.store (ccs[r - 11]); safe->setStatus ("Pedal: CC " + juce::String (ccs[r - 11])); }
-        else if (r >= 21 && r <= 23)
+        auto setChoice = [&p] (const char* id, int v)
         {
-            if (auto* prm = p.apvts.getParameter ("pedalMode")) prm->setValueNotifyingHost (prm->convertTo0to1 ((float) (r - 21)));
+            if (auto* prm = p.apvts.getParameter (id)) prm->setValueNotifyingHost (prm->convertTo0to1 ((float) v));
+        };
+        if (r >= 102 && r <= 104)        { if (safe->onSizeRequest) safe->onSizeRequest (r == 104 ? -1 : r - 101); }
+        else if (r >= 1000 && r < 1100)
+        {
+            const int t = (r - 1000) / 10, k = (r - 1000) % 10;
+            if (k == 0)      p.learnTarget.store (t);
+            else if (k == 1) { p.targetCC[(size_t) t].store (-1); if (t == P::kPitch) p.apvts.getParameter ("expression")->setValueNotifyingHost (0.0f);
+                               safe->setStatus (juce::String (P::getTargetName (t)) + ": MIDI cleared"); }
+            else             { p.assignCC (P::kPitch, ccs[k - 2]); safe->setStatus ("PITCH: CC " + juce::String (ccs[k - 2])); }
         }
-        else if (r == 30) p.learnTarget.store (2);
+        else if (r >= 21 && r <= 23)     setChoice ("pedalMode", r - 21);
+        else if (r >= 41 && r <= 43)     setChoice ("whammyRange", r - 41);
+        else if (r == 30) p.learnTarget.store (P::kLearnFootswitch);
         else if (r == 31) p.footswitchCC.store (-1);
-        else if (r == 32) p.footswitchCC.store (64);
-        else if (r == 33) p.footswitchCC.store (80);
+        else if (r == 32) p.assignCC (P::kLearnFootswitch, 64);
+        else if (r == 33) p.assignCC (P::kLearnFootswitch, 80);
     });
 }
 

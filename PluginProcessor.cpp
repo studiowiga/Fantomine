@@ -28,6 +28,39 @@ const std::vector<FactoryPreset>& FantomineAudioProcessor::getFactoryPresets()
     return presets;
 }
 
+// Une pédale = une fonction : un CC appris pour une cible est retiré des autres cibles
+// (sinon la pédale de whammy, souvent sur le CC 11, courbait aussi la hauteur et faussait les notes).
+void FantomineAudioProcessor::assignCC (int target, int cc)
+{
+    for (int t = 0; t < kNumTargets; ++t)
+        if (t != target && targetCC[(size_t) t].load() == cc) targetCC[(size_t) t].store (-1);
+    if (target != kLearnFootswitch && footswitchCC.load() == cc) footswitchCC.store (-1);
+
+    if (target == kLearnFootswitch) footswitchCC.store (cc);
+    else                            targetCC[(size_t) target].store (cc);
+
+    // la hauteur repart à zéro si sa pédale vient d'être retirée
+    if (targetCC[kPitch].load() < 0) expressionValue.store (0.0f);
+}
+
+// Courbe de pédale : zone morte au talon (et au centre en BIPOLAR) et fin de course atteinte avant la butée.
+// Une pédale d'expression envoie rarement 0 pile au talon : sans cette zone, la voix restait désaccordée.
+float FantomineAudioProcessor::shapePedal (float e, bool bipolar)
+{
+    constexpr float dead = 0.04f, top = 0.97f;
+    e = juce::jlimit (0.0f, 1.0f, e);
+    if (! bipolar) return juce::jlimit (0.0f, 1.0f, (e - dead) / (top - dead));
+    const float d = e - 0.5f;
+    const float a = juce::jlimit (0.0f, 1.0f, (std::abs (d) - dead * 0.5f) / (0.5f - dead * 0.5f - (1.0f - top)));
+    return 0.5f + (d < 0 ? -0.5f : 0.5f) * a;
+}
+
+const char* FantomineAudioProcessor::getTargetName (int t)
+{
+    static const char* n[] = { "PITCH", "OCTAVE", "VIBRATO", "SPEED", "BLEND" };
+    return juce::isPositiveAndBelow (t, (int) kNumTargets) ? n[t] : "";
+}
+
 //==============================================================================
 juce::AudioProcessorValueTreeState::ParameterLayout FantomineAudioProcessor::createLayout()
 {
@@ -46,6 +79,9 @@ juce::AudioProcessorValueTreeState::ParameterLayout FantomineAudioProcessor::cre
         AudioParameterFloatAttributes().withStringFromValueFunction ([] (float v, int) { return String (3.0 * std::pow (3.0, (double) v), 1) + " Hz"; })));
     p.push_back (std::make_unique<AudioParameterFloat> (ParameterID { "blend", 1 },   "Blend",   NormalisableRange<float> (0.f, 1.f), 0.75f, pct));
     p.push_back (std::make_unique<AudioParameterChoice> (ParameterID { "octave", 1 }, "Octave", StringArray { "-1", "0", "+1" }, 1));
+    p.push_back (std::make_unique<AudioParameterFloat> (ParameterID { "whammy", 1 }, "Octave Whammy", NormalisableRange<float> (0.f, 1.f), 0.5f, pct));
+    p.push_back (std::make_unique<AudioParameterChoice> (ParameterID { "whammyRange", 1 }, "Whammy Range",
+                                                         StringArray { "-1 > +1 oct", "0 > +1 oct", "0 > -1 oct" }, 0));
     p.push_back (std::make_unique<AudioParameterChoice> (ParameterID { "pedalMode", 1 }, "Pedal Mode", StringArray { "Up", "Down", "Bipolar" }, 0));
     p.push_back (std::make_unique<AudioParameterFloat> (ParameterID { "expression", 1 }, "Expression", NormalisableRange<float> (0.f, 1.f), 0.0f, pct));
     p.push_back (std::make_unique<AudioParameterBool> (ParameterID { "bypass", 1 }, "Bypass", false));
@@ -70,9 +106,12 @@ FantomineAudioProcessor::FantomineAudioProcessor()
     pOctave = apvts.getRawParameterValue ("octave");
     pPedalMode = apvts.getRawParameterValue ("pedalMode");
     pBypass = apvts.getRawParameterValue ("bypass");
+    pWhammy = apvts.getRawParameterValue ("whammy");
+    pWhammyRange = apvts.getRawParameterValue ("whammyRange");
     pHold   = apvts.getRawParameterValue ("hold");
 
     apvts.addParameterListener ("expression", this);
+    apvts.addParameterListener ("whammy", this);
     for (auto& id : kParamIds) apvts.addParameterListener (id, this);
 
     loadUserPresetsFromDisk();
@@ -81,6 +120,7 @@ FantomineAudioProcessor::FantomineAudioProcessor()
 FantomineAudioProcessor::~FantomineAudioProcessor()
 {
     apvts.removeParameterListener ("expression", this);
+    apvts.removeParameterListener ("whammy", this);
     for (auto& id : kParamIds) apvts.removeParameterListener (id, this);
 }
 
@@ -88,8 +128,13 @@ void FantomineAudioProcessor::parameterChanged (const juce::String& id, float ne
 {
     if (id == "expression")
         expressionValue.store (newValue);
-    else if (! applyingPreset.load())
-        presetDirty.store (true);
+    else if (id == "whammy")
+        whammyActive.store (true);                 // la pédale prend la main sur le levier d'octave
+    else
+    {
+        if (id == "octave") whammyActive.store (false);   // levier touché (ou preset) : retour aux 3 positions
+        if (! applyingPreset.load()) presetDirty.store (true);
+    }
 }
 
 //==============================================================================
@@ -166,21 +211,31 @@ void FantomineAudioProcessor::handleMidi (const juce::MidiBuffer& midi, int)
 
         // MIDI learn depuis le menu clic droit
         const int learn = learnTarget.load();
-        if (learn == 1 && (cc < 32 || cc > 63)) { expressionCC.store (cc); learnTarget.store (0); }
-        else if (learn == 2)                     { footswitchCC.store (cc); learnTarget.store (0); }
+        if (learn == kLearnFootswitch)                          { assignCC (kLearnFootswitch, cc); learnTarget.store (-1); }
+        else if (learn >= 0 && learn < kNumTargets && (learn != kPitch || cc < 32 || cc > 63))
+                                                                { assignCC (learn, cc); learnTarget.store (-1); }
 
-        const int expCC = expressionCC.load();
-        if (cc == expCC)
+        const float v = (float) val / 127.0f;
+        const int pitchCC = targetCC[kPitch].load();
+        if (cc == pitchCC)
         {
             ccMSB = val;
-            expressionValue.store ((float) val / 127.0f);
+            expressionValue.store (v);
         }
-        else if (expCC < 32 && cc == expCC + 32)
+        else if (pitchCC >= 0 && pitchCC < 32 && cc == pitchCC + 32)
         {
             // LSB d'un CC 14 bits : résolution de 16384 pas
             expressionValue.store ((float) ((ccMSB << 7) | val) / 16383.0f);
         }
-        else if (cc == footswitchCC.load())
+
+        // chaque CC pilote une seule cible (voir assignCC)
+        static const char* ids[kNumTargets] = { nullptr, "whammy", "vibrato", "speed", "blend" };
+        for (int t = kOctave; t < kNumTargets; ++t)
+            if (cc == targetCC[(size_t) t].load())
+                if (auto* prm = apvts.getParameter (ids[t]))
+                    prm->setValueNotifyingHost (v);   // le potard (ou le levier) suit la pédale
+
+        if (cc == footswitchCC.load())
         {
             if (val >= 64) footswitchDown(); else footswitchUp();
         }
@@ -220,9 +275,22 @@ void FantomineAudioProcessor::processBlock (juce::AudioBuffer<float>& buffer, ju
     params.vibrato    = pVib->load();
     params.speed      = pSpeed->load();
     params.blend      = pBlend->load();
-    params.octave     = juce::roundToInt (pOctave->load()) - 1;
+    if (whammyActive.load())
+    {
+        const int wr = juce::roundToInt (pWhammyRange->load());
+        const float w = shapePedal (pWhammy->load(), wr == 0);
+        switch (wr)
+        {
+            case 1:  params.octaveSemis =  12.0f * w; break;            // talon 0, pointe +1 octave
+            case 2:  params.octaveSemis = -12.0f * w; break;            // talon 0, pointe -1 octave
+            default: params.octaveSemis = -12.0f + 24.0f * w; break;    // talon -1, milieu 0, pointe +1
+        }
+    }
+    else
+        params.octaveSemis = 12.0f * (float) (juce::roundToInt (pOctave->load()) - 1);
+    uiOctave.store (params.octaveSemis / 12.0f);
     params.pedalMode  = juce::roundToInt (pPedalMode->load());
-    params.expression = expressionValue.load();
+    params.expression = shapePedal (expressionValue.load(), params.pedalMode == 2);
     params.hold       = pHold->load() > 0.5f;
 
     auto* mo = monoOut.getWritePointer (0);
@@ -367,7 +435,9 @@ void FantomineAudioProcessor::getStateInformation (juce::MemoryBlock& destData)
 {
     auto state = apvts.copyState();
     state.setProperty ("version", kStateVersion, nullptr);
-    state.setProperty ("expressionCC", expressionCC.load(), nullptr);
+    for (int t = 0; t < kNumTargets; ++t)
+        state.setProperty ("cc" + juce::String (t), targetCC[(size_t) t].load(), nullptr);
+    state.setProperty ("whammyActive", whammyActive.load(), nullptr);
     state.setProperty ("footswitchCC", footswitchCC.load(), nullptr);
     state.setProperty ("uiScaleIdx", uiScaleIdx.load(), nullptr);
     state.setProperty ("presetName", currentPresetName, nullptr);
@@ -382,12 +452,17 @@ void FantomineAudioProcessor::setStateInformation (const void* data, int sizeInB
     {
         auto state = juce::ValueTree::fromXml (*xml);
         if (! state.hasType (apvts.state.getType())) return;
-        expressionCC.store ((int) state.getProperty ("expressionCC", 11));
+        for (int t = 0; t < kNumTargets; ++t)
+            targetCC[(size_t) t].store ((int) state.getProperty ("cc" + juce::String (t), t == kPitch ? 11 : -1));
+        if (state.hasProperty ("expressionCC"))                       // projets de la première version
+            targetCC[kPitch].store ((int) state.getProperty ("expressionCC"));
         footswitchCC.store ((int) state.getProperty ("footswitchCC", -1));
         uiScaleIdx.store ((int) state.getProperty ("uiScaleIdx", -1));
         currentPresetName = state.getProperty ("presetName", "Classic Theremin").toString();
         currentProgram = (int) state.getProperty ("program", 0);
+        const bool wa = (bool) state.getProperty ("whammyActive", false);
         apvts.replaceState (state);
+        whammyActive.store (wa);
         expressionValue.store (apvts.getRawParameterValue ("expression")->load());
     }
 }

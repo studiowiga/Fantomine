@@ -39,7 +39,7 @@ private:
 class OctaveSwitch : public juce::Component
 {
 public:
-    OctaveSwitch (juce::RangedAudioParameter& p, const juce::Image& handle);
+    OctaveSwitch (FantomineAudioProcessor& pr, juce::RangedAudioParameter& p, const juce::Image& handle);
     void paint (juce::Graphics&) override;
     void mouseDown (const juce::MouseEvent&) override;
     void mouseDrag (const juce::MouseEvent&) override;
@@ -48,6 +48,7 @@ public:
     float anim = 1.0f;
 private:
     void setFromX (float x);
+    FantomineAudioProcessor& proc;
     juce::ParameterAttachment attachment;
     juce::Image handle;
 };
@@ -108,7 +109,7 @@ public:
 private:
     void sliderValueChanged (juce::Slider*) override;
     void sliderDragStarted (juce::Slider*) override;
-    void showContextMenu();
+    void showContextMenu (int focusTarget = -1);
     void setStatus (const juce::String& s, double seconds = 2.5);
 
     FantomineAudioProcessor& proc;
@@ -124,7 +125,7 @@ private:
 
     juce::String statusText;
     double statusUntil = 0.0;
-    float ledPulse = 0.0f, flickerT = 1.0f, lastPower = -1.0f;
+    float ledPulse = 0.0f, flickerT = 1.0f, lastPower = -1.0f, lastOct = 0.0f;
     bool wasOn = true;
 };
 
