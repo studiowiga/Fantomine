@@ -90,6 +90,7 @@ private:
     FantomineAudioProcessor& proc;
     const Lights& lights;
     float phase = 0.0f, ampSm = 0.0f, midiSm = 57.0f, expSm = 0.0f, midiBlink = 0.0f;
+    float drawnPower = -1.0f;        // dernière luminosité vue par tick() : écran éteint = rien à redessiner
     bool draggingExp = false;
 };
 
@@ -111,6 +112,7 @@ private:
     void sliderDragStarted (juce::Slider*) override;
     void showContextMenu (int focusTarget = -1);
     void setStatus (const juce::String& s, double seconds = 2.5);
+    juce::String currentStatusText() const;
 
     FantomineAudioProcessor& proc;
     Lights lights;
@@ -127,6 +129,11 @@ private:
     double statusUntil = 0.0;
     float ledPulse = 0.0f, flickerT = 1.0f, lastPower = -1.0f, lastOct = 0.0f;
     bool wasOn = true;
+
+    // dernier état réellement dessiné : on ne redessine une zone que si elle a changé
+    float drawnTitle = -1.0f, drawnLed = -1.0f;
+    juce::String drawnStatus;
+    bool drawnStatusBypass = false, statusDrawnOnce = false;
 };
 
 //==============================================================================
@@ -137,12 +144,14 @@ public:
     ~FantomineAudioProcessorEditor() override;
     void paint (juce::Graphics& g) override { g.fillAll (juce::Colours::black); }
     void resized() override;
+    void parentHierarchyChanged() override;
 
     int  getScaleIndex() const;
     void setScaleIndex (int idx);
 
 private:
     void timerCallback() override;
+    void useSoftwareRenderer();
 
     FantomineAudioProcessor& proc;
     PedalView pedal;

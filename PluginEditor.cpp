@@ -205,7 +205,13 @@ void GhostDisplay::tick (float dt)
     phase  += dt * 1.6f;
     if (proc.midiActivity.exchange (0.0f) > 0.0f) midiBlink = 1.0f;
     midiBlink = juce::jmax (0.0f, midiBlink - dt * 4.0f);
-    repaint();
+
+    // la voix fantôme ondule en continu quand la pédale est allumée : on redessine à chaque tic.
+    // Éteint (bypass), paint() ne dessine rien : un dernier redessin pour effacer, puis plus rien.
+    const float on = lights.power;
+    if (on >= 0.01f || drawnPower >= 0.01f)
+        repaint();
+    drawnPower = on;
 }
 
 void GhostDisplay::paint (juce::Graphics& g)
@@ -501,6 +507,14 @@ void PedalView::paintOverChildren (juce::Graphics& g)
     }
 
     // ligne d'état
+    const juce::String txt = currentStatusText();
+    g.setColour (juce::Colour (0xffd8dae4).withAlpha (isBypassed (proc) ? 0.55f : 0.95f));
+    g.setFont (uiFont (18.5f));
+    g.drawFittedText (txt, kStatus.reduced (12, 0), juce::Justification::centred, 1, 0.9f);
+}
+
+juce::String PedalView::currentStatusText() const
+{
     juce::String txt = statusText;
     if (juce::Time::getMillisecondCounterHiRes() > statusUntil)
     {
@@ -510,15 +524,11 @@ void PedalView::paintOverChildren (juce::Graphics& g)
         if (lt == FantomineAudioProcessor::kLearnFootswitch) txt = "LEARN: press your MIDI footswitch";
         else if (lt >= 0) txt = "LEARN " + juce::String (FantomineAudioProcessor::getTargetName (lt)) + ": move the pedal";
     }
-    g.setColour (juce::Colour (0xffd8dae4).withAlpha (isBypassed (proc) ? 0.55f : 0.95f));
-    g.setFont (uiFont (18.5f));
-    g.drawFittedText (txt, kStatus.reduced (12, 0), juce::Justification::centred, 1, 0.9f);
+    return txt;
 }
 
 void PedalView::tick (float dt)
 {
-    display.tick (dt);
-
     const bool on = ! isBypassed (proc);
     const bool hold = isHold (proc);
 
@@ -527,6 +537,8 @@ void PedalView::tick (float dt)
     const float fadeSpeed = on ? 9.0f : 14.0f;
     lights.power += (target - lights.power) * juce::jmin (1.0f, dt * fadeSpeed);
     if (std::abs (target - lights.power) < 0.002f) lights.power = target;
+
+    display.tick (dt);   // après le fondu : l'écran sait tout de suite s'il doit se rallumer
 
     // néon : petit scintillement à l'allumage
     if (on && ! wasOn) flickerT = 0.0f;
@@ -575,9 +587,23 @@ void PedalView::tick (float dt)
         lastPower = lights.power;
     }
 
-    repaint (kTitlePos.x, kTitlePos.y, titleOn.getWidth(), titleOn.getHeight());
-    repaint (kLedPos.x, kLedPos.y, ledOn.getWidth(), ledOn.getHeight());
-    repaint (kStatus);
+    // on ne redessine une zone que si ce qu'elle affiche a vraiment changé (zéro travail au repos)
+    auto changed = [] (float& drawn, float now) { if (std::abs (drawn - now) < 0.002f) return false; drawn = now; return true; };
+
+    if (changed (drawnTitle, lights.title))
+        repaint (kTitlePos.x, kTitlePos.y, titleOn.getWidth(), titleOn.getHeight());
+    if (changed (drawnLed, lights.led))
+        repaint (kLedPos.x, kLedPos.y, ledOn.getWidth(), ledOn.getHeight());
+
+    const juce::String st = currentStatusText();
+    const bool bypassed = isBypassed (proc);
+    if (! statusDrawnOnce || st != drawnStatus || bypassed != drawnStatusBypass)
+    {
+        statusDrawnOnce = true;
+        drawnStatus = st;
+        drawnStatusBypass = bypassed;
+        repaint (kStatus);
+    }
 }
 
 void PedalView::mouseDown (const juce::MouseEvent& e)
@@ -708,6 +734,28 @@ FantomineAudioProcessorEditor::FantomineAudioProcessorEditor (FantomineAudioProc
 
 FantomineAudioProcessorEditor::~FantomineAudioProcessorEditor() { stopTimer(); }
 
+//==============================================================================
+// Anti-gel de la fenêtre (Windows) : JUCE 8+ dessine par défaut avec Direct2D (carte graphique).
+// Avec certains pilotes (Intel notamment) la fenêtre du plugin cesse de se rafraîchir alors que
+// le DAW continue de tourner. Le moteur logiciel est stable partout et largement assez rapide ici.
+void FantomineAudioProcessorEditor::useSoftwareRenderer()
+{
+   #if JUCE_WINDOWS
+    if (auto* peer = getPeer())
+    {
+        int sw = peer->getAvailableRenderingEngines().indexOf ("Software Renderer");
+        if (sw < 0) sw = 0;
+        if (peer->getCurrentRenderingEngine() != sw)
+            peer->setCurrentRenderingEngine (sw);
+    }
+   #endif
+}
+
+void FantomineAudioProcessorEditor::parentHierarchyChanged()
+{
+    useSoftwareRenderer();
+}
+
 void FantomineAudioProcessorEditor::resized()
 {
     const float s = (float) getWidth() / (float) ui::kW;
@@ -737,5 +785,6 @@ void FantomineAudioProcessorEditor::timerCallback()
     const double now = juce::Time::getMillisecondCounterHiRes();
     const float dt = (float) juce::jlimit (0.0, 0.1, (now - lastTick) / 1000.0);
     lastTick = now;
+    useSoftwareRenderer();   // au cas où la fenêtre a été recréée par l'hôte (changement d'écran, d'échelle…)
     pedal.tick (dt);
 }
