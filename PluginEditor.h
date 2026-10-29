@@ -79,6 +79,7 @@ public:
     void mouseUp (const juce::MouseEvent&) override;
     void tick (float dt);
     std::function<void (const juce::String&)> showStatus;
+    bool isOverModeArea (juce::Point<float> p) const { return modeArea().expanded (4.0f).contains (p); }   // clic droit : MIDI Learn PEDAL MODE
 
 private:
     void showPresetMenu();
@@ -116,7 +117,7 @@ public:
 private:
     void sliderValueChanged (juce::Slider*) override;
     void sliderDragStarted (juce::Slider*) override;
-    void showContextMenu (int focusTarget = -1);
+    void showContextMenu (int focusTarget = -1);   // focusTarget : cible MIDI (0..8) ou kLearnFootswitch, -1 = hors commande
     void setStatus (const juce::String& s, double seconds = 2.5);
     juce::String currentStatusText() const;
 

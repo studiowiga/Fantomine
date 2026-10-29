@@ -546,10 +546,10 @@ juce::String PedalView::currentStatusText() const
     {
         txt = isBypassed (proc) ? juce::String ("BYPASS")
                                 : (isHold (proc) ? juce::String ("HOLD  -  tap to release") : proc.getCurrentPresetName());
-        const int lt = proc.learnTarget.load();
-        if (lt == FantomineAudioProcessor::kLearnFootswitch) txt = "LEARN: press your MIDI footswitch";
-        else if (lt >= 0) txt = "LEARN " + juce::String (FantomineAudioProcessor::getTargetName (lt)) + ": move the pedal";
     }
+    // MIDI Learn en attente : prioritaire sur tout autre message
+    const int lt = proc.learnTarget.load();
+    if (lt >= 0) txt = "MIDI LEARN: move a control for " + juce::String (FantomineAudioProcessor::getTargetName (lt));
     return txt;
 }
 
@@ -621,6 +621,15 @@ void PedalView::tick (float dt)
     if (changed (drawnLed, lights.led))
         askRepaint ({ kLedPos.x, kLedPos.y, ledOn.getWidth(), ledOn.getHeight() });
 
+    // MIDI Learn : confirmation « <Commande> = CC n » pendant 2 s
+    const int learned = proc.lastLearned.exchange (-1);
+    if (learned >= 0)
+    {
+        const int cc = learned == FantomineAudioProcessor::kLearnFootswitch ? proc.footswitchCC.load()
+                                                                            : proc.targetCC[(size_t) learned].load();
+        setStatus (juce::String (FantomineAudioProcessor::getTargetName (learned)) + " = CC " + juce::String (cc), 2.0);
+    }
+
     const juce::String st = currentStatusText();
     const bool bypassed = isBypassed (proc);
     if (! statusDrawnOnce || st != drawnStatus || bypassed != drawnStatusBypass)
@@ -641,8 +650,14 @@ void PedalView::mouseDown (const juce::MouseEvent& e)
     if (src == &vibrato) focus = FantomineAudioProcessor::kVibrato;
     else if (src == &speed) focus = FantomineAudioProcessor::kSpeed;
     else if (src == &blend) focus = FantomineAudioProcessor::kBlend;
+    else if (src == &glide) focus = FantomineAudioProcessor::kGlide;
+    else if (src == &range) focus = FantomineAudioProcessor::kRange;
+    else if (src == &tone)  focus = FantomineAudioProcessor::kTone;
     else if (src == octave.get()) focus = FantomineAudioProcessor::kOctave;
-    else if (src == &display) focus = FantomineAudioProcessor::kPitch;
+    else if (src == &footswitch)  focus = FantomineAudioProcessor::kLearnFootswitch;
+    else if (src == &display)
+        focus = display.isOverModeArea (e.getEventRelativeTo (&display).position) ? FantomineAudioProcessor::kPedalMode
+                                                                                  : FantomineAudioProcessor::kPitch;
     showContextMenu (focus);
 }
 
@@ -653,12 +668,18 @@ void PedalView::showContextMenu (int focus)
 
     auto ccText = [] (int cc) { return cc < 0 ? juce::String ("not assigned") : "CC " + juce::String (cc); };
 
+    // clic droit sur une commande : MIDI Learn de cette commande en tête du menu
+    const int lt = proc.learnTarget.load();
     if (focus >= 0)
     {
-        const int cc = proc.targetCC[(size_t) focus].load();
-        m.addSectionHeader (juce::String (P::getTargetName (focus)) + "  -  " + ccText (cc));
-        m.addItem (1000 + focus * 10, "MIDI Learn: move the expression pedal");
-        if (cc >= 0) m.addItem (1001 + focus * 10, "Clear MIDI assignment");
+        const bool fs = focus == P::kLearnFootswitch;
+        const int cc = fs ? proc.footswitchCC.load() : proc.targetCC[(size_t) focus].load();
+        const juce::String name = P::getTargetName (focus);
+        m.addSectionHeader (name);
+        m.addItem (fs ? 30 : 1000 + focus * 10, "MIDI Learn: " + name + " (" + (cc >= 0 ? "CC " + juce::String (cc) : juce::String ("none")) + ")",
+                   true, lt == focus);
+        m.addItem (fs ? 31 : 1001 + focus * 10, "Clear MIDI: " + name, cc >= 0);
+        if (lt >= 0) m.addItem (1200, "Cancel MIDI learn");
         m.addSeparator();
     }
 
@@ -678,8 +699,11 @@ void PedalView::showContextMenu (int focus)
         }
         const juce::String label = t == P::kPitch  ? "PITCH (bend)"
                                  : t == P::kOctave ? "OCTAVE (whammy)" : juce::String (P::getTargetName (t));
-        pedals.addSubMenu (label + "   " + ccText (cc), sub);
+        pedals.addSubMenu ("Learn: " + label + "   " + ccText (cc), sub, true, nullptr, lt == t);
     }
+    pedals.addSeparator();
+    if (lt >= 0) pedals.addItem (1200, "Cancel MIDI learn");
+    pedals.addItem (1201, "Reset MIDI to defaults (PITCH CC 11, others none)");
     m.addSubMenu ("Expression pedals (MIDI)", pedals);
 
     const int wr = juce::roundToInt (proc.apvts.getRawParameterValue ("whammyRange")->load());
@@ -719,17 +743,19 @@ void PedalView::showContextMenu (int focus)
             if (auto* prm = p.apvts.getParameter (id)) prm->setValueNotifyingHost (prm->convertTo0to1 ((float) v));
         };
         if (r >= 102 && r <= 104)        { if (safe->onSizeRequest) safe->onSizeRequest (r == 104 ? -1 : r - 101); }
+        else if (r == 1200) p.learnTarget.store (-1);
+        else if (r == 1201) { p.resetMidiMap(); safe->setStatus ("MIDI reset to defaults"); }
         else if (r >= 1000 && r < 1100)
         {
             const int t = (r - 1000) / 10, k = (r - 1000) % 10;
-            if (k == 0)      p.learnTarget.store (t);
+            if (k == 0)      p.learnTarget.store (p.learnTarget.load() == t ? -1 : t);   // re-cliquer annule
             else if (k == 1) { p.targetCC[(size_t) t].store (-1); if (t == P::kPitch) p.apvts.getParameter ("expression")->setValueNotifyingHost (0.0f);
                                safe->setStatus (juce::String (P::getTargetName (t)) + ": MIDI cleared"); }
             else             { p.assignCC (P::kPitch, ccs[k - 2]); safe->setStatus ("PITCH: CC " + juce::String (ccs[k - 2])); }
         }
         else if (r >= 21 && r <= 23)     setChoice ("pedalMode", r - 21);
         else if (r >= 41 && r <= 43)     setChoice ("whammyRange", r - 41);
-        else if (r == 30) p.learnTarget.store (P::kLearnFootswitch);
+        else if (r == 30) p.learnTarget.store (p.learnTarget.load() == P::kLearnFootswitch ? -1 : P::kLearnFootswitch);
         else if (r == 31) p.footswitchCC.store (-1);
         else if (r == 32) p.assignCC (P::kLearnFootswitch, 64);
         else if (r == 33) p.assignCC (P::kLearnFootswitch, 80);

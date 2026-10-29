@@ -43,6 +43,13 @@ void FantomineAudioProcessor::assignCC (int target, int cc)
     if (targetCC[kPitch].load() < 0) expressionValue.store (0.0f);
 }
 
+void FantomineAudioProcessor::resetMidiMap()
+{
+    learnTarget.store (-1);
+    for (int t = 0; t < kNumTargets; ++t) targetCC[(size_t) t].store (t == kPitch ? 11 : -1);
+    footswitchCC.store (-1);
+}
+
 // Courbe de pédale : zone morte au talon (et au centre en BIPOLAR) et fin de course atteinte avant la butée.
 // Une pédale d'expression envoie rarement 0 pile au talon : sans cette zone, la voix restait désaccordée.
 float FantomineAudioProcessor::shapePedal (float e, bool bipolar)
@@ -57,7 +64,8 @@ float FantomineAudioProcessor::shapePedal (float e, bool bipolar)
 
 const char* FantomineAudioProcessor::getTargetName (int t)
 {
-    static const char* n[] = { "PITCH", "OCTAVE", "VIBRATO", "SPEED", "BLEND" };
+    static const char* n[] = { "PITCH", "OCTAVE", "VIBRATO", "SPEED", "BLEND", "GLIDE", "RANGE", "TONE", "PEDAL MODE" };
+    if (t == kLearnFootswitch) return "FOOTSWITCH";
     return juce::isPositiveAndBelow (t, (int) kNumTargets) ? n[t] : "";
 }
 
@@ -114,7 +122,7 @@ FantomineAudioProcessor::FantomineAudioProcessor()
     apvts.addParameterListener ("whammy", this);
     for (auto& id : kParamIds) apvts.addParameterListener (id, this);
 
-    for (int i = 0; i < kNumQueued; ++i) { pendingValue[i] = 0.0f; pendingSet[i] = false; }
+    for (int i = 0; i < kNumQueued; ++i) { pendingValue[i] = 0.0f; pendingSet[i] = false; queuedParam[i] = apvts.getParameter (queuedId (i)); }
     for (auto& h : harmonics) h.store (0.0f);
 
     loadUserPresetsFromDisk();
@@ -173,7 +181,7 @@ void FantomineAudioProcessor::setParam (const char* id, float plainValue)
 // le timer du processeur (thread message) la transmet au DAW et à la fenêtre.
 const char* FantomineAudioProcessor::queuedId (int i)
 {
-    static const char* ids[kNumQueued] = { "hold", "bypass", "whammy", "vibrato", "speed", "blend" };
+    static const char* ids[kNumQueued] = { "hold", "bypass", "whammy", "vibrato", "speed", "blend", "glide", "range", "tone", "pedalMode" };
     return ids[juce::jlimit (0, kNumQueued - 1, i)];
 }
 
@@ -186,6 +194,13 @@ void FantomineAudioProcessor::setParamQueued (const char* id, float plainValue)
             pendingSet[i].store (true, std::memory_order_release);
             return;
         }
+}
+
+void FantomineAudioProcessor::setQueuedIndex (int qi, float plainValue)
+{
+    if (qi < 0 || qi >= kNumQueued) return;
+    pendingValue[qi].store (plainValue, std::memory_order_relaxed);
+    pendingSet[qi].store (true, std::memory_order_release);
 }
 
 // bascule : part de la valeur en file si elle existe, sinon de la valeur courante
@@ -251,11 +266,15 @@ void FantomineAudioProcessor::handleMidi (const juce::MidiBuffer& midi, int)
         lastCCSeen.store (cc);
         midiActivity.store (1.0f);
 
-        // MIDI learn depuis le menu clic droit
+        // MIDI learn depuis le menu clic droit (le CC appris ne fait rien d'autre dans ce message)
         const int learn = learnTarget.load();
-        if (learn == kLearnFootswitch)                          { assignCC (kLearnFootswitch, cc); learnTarget.store (-1); }
-        else if (learn >= 0 && learn < kNumTargets && (learn != kPitch || cc < 32 || cc > 63))
-                                                                { assignCC (learn, cc); learnTarget.store (-1); }
+        if (cc < 120 && (learn == kLearnFootswitch || (learn >= 0 && learn < kNumTargets && (learn != kPitch || cc < 32 || cc > 63))))
+        {
+            assignCC (learn, cc);
+            lastLearned.store (learn);
+            learnTarget.store (-1);
+            continue;
+        }
 
         const float v = (float) val / 127.0f;
         const int pitchCC = targetCC[kPitch].load();
@@ -270,11 +289,13 @@ void FantomineAudioProcessor::handleMidi (const juce::MidiBuffer& midi, int)
             expressionValue.store ((float) ((ccMSB << 7) | val) / 16383.0f);
         }
 
-        // chaque CC pilote une seule cible (voir assignCC)
-        static const char* ids[kNumTargets] = { nullptr, "whammy", "vibrato", "speed", "blend" };
+        // chaque CC pilote une seule cible (voir assignCC) ; cible t -> file t + 1
         for (int t = kOctave; t < kNumTargets; ++t)
             if (cc == targetCC[(size_t) t].load())
-                setParamQueued (ids[t], v);           // le potard (ou le levier) suit la pédale (plages 0..1)
+            {
+                if (t == kPedalMode) setQueuedIndex (t + 1, (float) juce::jmin (2, val * 3 / 128));   // 3 positions UP / DOWN / BIPOLAR
+                else                 setQueuedIndex (t + 1, queuedParam[t + 1]->convertFrom0to1 (v));  // le potard (ou le levier) suit la pédale
+            }
 
         if (cc == footswitchCC.load())
         {
@@ -492,8 +513,9 @@ void FantomineAudioProcessor::setStateInformation (const void* data, int sizeInB
     {
         auto state = juce::ValueTree::fromXml (*xml);
         if (! state.hasType (apvts.state.getType())) return;
-        for (int t = 0; t < kNumTargets; ++t)
-            targetCC[(size_t) t].store ((int) state.getProperty ("cc" + juce::String (t), t == kPitch ? 11 : -1));
+        learnTarget.store (-1);
+        for (int t = 0; t < kNumTargets; ++t)      // cc5..cc8 absents des projets < 1.3 : non assignés
+            targetCC[(size_t) t].store (juce::jlimit (-1, 127, (int) state.getProperty ("cc" + juce::String (t), t == kPitch ? 11 : -1)));
         if (state.hasProperty ("expressionCC"))                       // projets de la première version
             targetCC[kPitch].store ((int) state.getProperty ("expressionCC"));
         footswitchCC.store ((int) state.getProperty ("footswitchCC", -1));

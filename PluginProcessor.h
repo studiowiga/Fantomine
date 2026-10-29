@@ -59,14 +59,17 @@ public:
     std::atomic<bool> presetDirty { false };   // un potard a bougé depuis le chargement
 
     // MIDI : pédales d'expression (une par cible) et footswitch
-    enum MidiTarget { kPitch = 0, kOctave, kVibrato, kSpeed, kBlend, kNumTargets };
+    // v1.3 : MIDI Learn sur toutes les commandes (GLIDE, RANGE, TONE et le sens de la pédale en plus)
+    enum MidiTarget { kPitch = 0, kOctave, kVibrato, kSpeed, kBlend, kGlide, kRange, kTone, kPedalMode, kNumTargets };
     static const char* getTargetName (int t);
     void assignCC (int target, int cc);          // target 0..4 ou kLearnFootswitch ; retire ce CC des autres cibles
     static float shapePedal (float e, bool bipolar);
-    std::array<std::atomic<int>, kNumTargets> targetCC { { { 11 }, { -1 }, { -1 }, { -1 }, { -1 } } };  // -1 = non assigné
+    std::array<std::atomic<int>, kNumTargets> targetCC { { { 11 }, { -1 }, { -1 }, { -1 }, { -1 }, { -1 }, { -1 }, { -1 }, { -1 } } };  // -1 = non assigné
     std::atomic<int>  footswitchCC { -1 };     // -1 = non assigné (utiliser le MIDI learn du DAW)
     static constexpr int kLearnFootswitch = 100;
-    std::atomic<int>  learnTarget  { -1 };     // -1 = rien, 0..4 = cible, kLearnFootswitch = footswitch
+    std::atomic<int>  learnTarget  { -1 };     // -1 = rien, 0..8 = cible, kLearnFootswitch = footswitch
+    std::atomic<int>  lastLearned  { -1 };     // dernière cible apprise (lue et remise à -1 par la fenêtre)
+    void resetMidiMap();                       // PITCH = CC 11, le reste non assigné
 
     // octave pilotée en continu par une pédale (façon Whammy)
     std::atomic<bool>  whammyActive { false };
@@ -121,7 +124,9 @@ private:
     // Anti-gel v2 (Studio Wiga) : valeurs demandées depuis le thread audio (MIDI, footswitch MIDI),
     // transmises à l'hôte par le timer du processeur (60 Hz, thread message)
     void timerCallback() override;
-    static constexpr int kNumQueued = 6;
+    static constexpr int kNumQueued = 10;     // cible t (1..8) -> file t + 1
+    juce::RangedAudioParameter* queuedParam[kNumQueued] {};
+    void setQueuedIndex (int qi, float plainValue);
     static const char* queuedId (int i);
     void setParamQueued (const char* id, float plainValue);
     float queuedOrCurrent (const char* id, const std::atomic<float>* current) const;
