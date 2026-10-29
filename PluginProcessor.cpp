@@ -92,6 +92,8 @@ juce::AudioProcessorValueTreeState::ParameterLayout FantomineAudioProcessor::cre
                                                          StringArray { "-1 > +1 oct", "0 > +1 oct", "0 > -1 oct" }, 0));
     p.push_back (std::make_unique<AudioParameterChoice> (ParameterID { "pedalMode", 1 }, "Pedal Mode", StringArray { "Up", "Down", "Bipolar" }, 0));
     p.push_back (std::make_unique<AudioParameterFloat> (ParameterID { "expression", 1 }, "Expression", NormalisableRange<float> (0.f, 1.f), 0.0f, pct));
+    // v1.3.1 : sens des pédales d'expression MIDI inversé par défaut (comme Crycat et Wharry)
+    p.push_back (std::make_unique<AudioParameterBool> (ParameterID { "invert", 1 }, "MIDI Pedal Invert", true));
     p.push_back (std::make_unique<AudioParameterBool> (ParameterID { "bypass", 1 }, "Bypass", false));
     p.push_back (std::make_unique<AudioParameterBool> (ParameterID { "hold", 1 },   "Hold",   false));
 
@@ -117,6 +119,7 @@ FantomineAudioProcessor::FantomineAudioProcessor()
     pWhammy = apvts.getRawParameterValue ("whammy");
     pWhammyRange = apvts.getRawParameterValue ("whammyRange");
     pHold   = apvts.getRawParameterValue ("hold");
+    pInvert = apvts.getRawParameterValue ("invert");
 
     apvts.addParameterListener ("expression", this);
     apvts.addParameterListener ("whammy", this);
@@ -277,16 +280,19 @@ void FantomineAudioProcessor::handleMidi (const juce::MidiBuffer& midi, int)
         }
 
         const float v = (float) val / 127.0f;
+        // inversion (menu « Invert MIDI pedal direction », active par défaut) : pédales PITCH et OCTAVE seulement
+        const bool inv = pInvert->load (std::memory_order_relaxed) > 0.5f;
         const int pitchCC = targetCC[kPitch].load();
         if (cc == pitchCC)
         {
             ccMSB = val;
-            expressionValue.store (v);
+            expressionValue.store (inv ? 1.0f - v : v);
         }
         else if (pitchCC >= 0 && pitchCC < 32 && cc == pitchCC + 32)
         {
             // LSB d'un CC 14 bits : résolution de 16384 pas
-            expressionValue.store ((float) ((ccMSB << 7) | val) / 16383.0f);
+            const float v14 = (float) ((ccMSB << 7) | val) / 16383.0f;
+            expressionValue.store (inv ? 1.0f - v14 : v14);
         }
 
         // chaque CC pilote une seule cible (voir assignCC) ; cible t -> file t + 1
@@ -294,7 +300,7 @@ void FantomineAudioProcessor::handleMidi (const juce::MidiBuffer& midi, int)
             if (cc == targetCC[(size_t) t].load())
             {
                 if (t == kPedalMode) setQueuedIndex (t + 1, (float) juce::jmin (2, val * 3 / 128));   // 3 positions UP / DOWN / BIPOLAR
-                else                 setQueuedIndex (t + 1, queuedParam[t + 1]->convertFrom0to1 (v));  // le potard (ou le levier) suit la pédale
+                else                 setQueuedIndex (t + 1, queuedParam[t + 1]->convertFrom0to1 (t == kOctave && inv ? 1.0f - v : v));  // le potard (ou le levier) suit la pédale
             }
 
         if (cc == footswitchCC.load())

@@ -704,6 +704,9 @@ void PedalView::showContextMenu (int focus)
     pedals.addSeparator();
     if (lt >= 0) pedals.addItem (1200, "Cancel MIDI learn");
     pedals.addItem (1201, "Reset MIDI to defaults (PITCH CC 11, others none)");
+    pedals.addSeparator();
+    const bool inv = proc.apvts.getRawParameterValue ("invert")->load() > 0.5f;
+    pedals.addItem (50, "Invert pedal direction", true, inv);
     m.addSubMenu ("Expression pedals (MIDI)", pedals);
 
     const int wr = juce::roundToInt (proc.apvts.getRawParameterValue ("whammyRange")->load());
@@ -717,6 +720,7 @@ void PedalView::showContextMenu (int focus)
     mode.addItem (22, "DOWN: heel = played note, toe = - Range", true, pm == 1);
     mode.addItem (23, "BIPOLAR: centre = played note", true, pm == 2);
     m.addSubMenu ("Pitch pedal direction", mode);
+    m.addItem (50, "Invert MIDI pedal direction (heel / toe)", true, inv);
 
     const int fcc = proc.footswitchCC.load();
     foot.addItem (30, "MIDI Learn (press the footswitch)");
@@ -756,6 +760,15 @@ void PedalView::showContextMenu (int focus)
         else if (r >= 21 && r <= 23)     setChoice ("pedalMode", r - 21);
         else if (r >= 41 && r <= 43)     setChoice ("whammyRange", r - 41);
         else if (r == 30) p.learnTarget.store (p.learnTarget.load() == P::kLearnFootswitch ? -1 : P::kLearnFootswitch);
+        else if (r == 50)
+        {
+            if (auto* prm = p.apvts.getParameter ("invert"))
+            {
+                const bool on = prm->getValue() < 0.5f;
+                prm->setValueNotifyingHost (on ? 1.0f : 0.0f);
+                safe->setStatus (on ? "MIDI pedal inverted" : "MIDI pedal normal");
+            }
+        }
         else if (r == 31) p.footswitchCC.store (-1);
         else if (r == 32) p.assignCC (P::kLearnFootswitch, 64);
         else if (r == 33) p.assignCC (P::kLearnFootswitch, 80);

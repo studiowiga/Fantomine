@@ -110,6 +110,7 @@ private:
     std::atomic<float>* pOctave = nullptr; std::atomic<float>* pPedalMode = nullptr;
     std::atomic<float>* pBypass = nullptr; std::atomic<float>* pHold = nullptr;
     std::atomic<float>* pWhammy = nullptr; std::atomic<float>* pWhammyRange = nullptr;
+    std::atomic<float>* pInvert = nullptr;
 
     // la pédale peut venir du paramètre (automation / MIDI learn du DAW) ou du CC direct
     std::atomic<float> expressionValue { 0.0f };
