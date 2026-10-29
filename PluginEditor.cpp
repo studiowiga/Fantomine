@@ -703,7 +703,7 @@ void PedalView::showContextMenu (int focus)
     m.addSubMenu ("Footswitch (MIDI)", foot);
 
     const int cur = getSizeIndex ? getSizeIndex() : -1;
-    size.addItem (104, "67 % (default)", true, cur < 0);
+    size.addItem (104, "60 % (default)", true, cur < 0);
     size.addItem (102, "75 %",  true, cur == 1);
     size.addItem (103, "100 %", true, cur == 2);
     m.addSeparator();
