@@ -21,7 +21,7 @@ jobs:
           path: build/Fantomine_artefacts/Release/VST3/Fantomine.vst3
 
   macos:
-    runs-on: macos-latest
+    runs-on: macos-15-intel   # Mac Intel : file Apple Silicon saturée (binaire universel quand même)
     steps:
       - uses: actions/checkout@v5
       - name: Configure (universel arm64 + x86_64)
