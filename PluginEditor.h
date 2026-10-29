@@ -107,6 +107,12 @@ public:
     std::function<void (int)> onSizeRequest;     // -1 = défaut (67 %), 1 = 75 %, 2 = 100 %
     std::function<int()> getSizeIndex;
 
+    // anti-gel v2 : fond à la taille réelle en pixels (refait par le timer de l'éditeur seulement)
+    // et suivi des redessins demandés pour le chien de garde
+    void rebuildCache (float pixelsPerArtPixel);
+    void askRepaint (juce::Rectangle<int> r);
+    double lastPaintMs = 0.0, repaintAskedMs = 0.0;
+
 private:
     void sliderValueChanged (juce::Slider*) override;
     void sliderDragStarted (juce::Slider*) override;
@@ -117,6 +123,7 @@ private:
     FantomineAudioProcessor& proc;
     Lights lights;
     juce::Image background, titleOn, ledOn, octHandle;
+    juce::Image bgCache;
 
     PedalKnob glide { "GLIDE", lights }, range { "RANGE", lights }, tone { "TONE", lights },
               vibrato { "VIBRATO", lights }, speed { "SPEED", lights }, blend { "BLEND", lights };
@@ -151,11 +158,21 @@ public:
 
 private:
     void timerCallback() override;
+    void visibilityChanged() override;
     void useSoftwareRenderer();
+    void rebuildCaches (float scale = 0.0f);
+    float physicalScale() const;
 
     FantomineAudioProcessor& proc;
     PedalView pedal;
     double lastTick = 0.0;
+
+    // anti-gel v2 : suivi de la fenêtre hôte, de l'échelle et du cache du fond
+    void* lastPeer = nullptr;
+    int cacheW = 0;
+    float cacheScale = 0.0f;
+    int resizeSettle = 0;
+    double lastScaleCheckMs = 0.0, lastRendererCheckMs = 0.0;
 
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (FantomineAudioProcessorEditor)
 };

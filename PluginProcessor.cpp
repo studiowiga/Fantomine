@@ -114,11 +114,16 @@ FantomineAudioProcessor::FantomineAudioProcessor()
     apvts.addParameterListener ("whammy", this);
     for (auto& id : kParamIds) apvts.addParameterListener (id, this);
 
+    for (int i = 0; i < kNumQueued; ++i) { pendingValue[i] = 0.0f; pendingSet[i] = false; }
+    for (auto& h : harmonics) h.store (0.0f);
+
     loadUserPresetsFromDisk();
+    startTimerHz (60);
 }
 
 FantomineAudioProcessor::~FantomineAudioProcessor()
 {
+    stopTimer();
     apvts.removeParameterListener ("expression", this);
     apvts.removeParameterListener ("whammy", this);
     for (auto& id : kParamIds) apvts.removeParameterListener (id, this);
@@ -163,6 +168,43 @@ void FantomineAudioProcessor::setParam (const char* id, float plainValue)
         p->setValueNotifyingHost (p->convertTo0to1 (plainValue));
 }
 
+// Anti-gel v2 (Studio Wiga) : jamais d'appel à l'hôte (setValueNotifyingHost) ni d'allocation depuis le
+// thread audio. Le MIDI et le footswitch (qui peut être piloté en MIDI) mettent la valeur en file ;
+// le timer du processeur (thread message) la transmet au DAW et à la fenêtre.
+const char* FantomineAudioProcessor::queuedId (int i)
+{
+    static const char* ids[kNumQueued] = { "hold", "bypass", "whammy", "vibrato", "speed", "blend" };
+    return ids[juce::jlimit (0, kNumQueued - 1, i)];
+}
+
+void FantomineAudioProcessor::setParamQueued (const char* id, float plainValue)
+{
+    for (int i = 0; i < kNumQueued; ++i)
+        if (std::strcmp (id, queuedId (i)) == 0)
+        {
+            pendingValue[i].store (plainValue, std::memory_order_relaxed);
+            pendingSet[i].store (true, std::memory_order_release);
+            return;
+        }
+}
+
+// bascule : part de la valeur en file si elle existe, sinon de la valeur courante
+float FantomineAudioProcessor::queuedOrCurrent (const char* id, const std::atomic<float>* current) const
+{
+    for (int i = 0; i < kNumQueued; ++i)
+        if (std::strcmp (id, queuedId (i)) == 0 && pendingSet[i].load (std::memory_order_acquire))
+            return pendingValue[i].load (std::memory_order_relaxed);
+    return current->load (std::memory_order_relaxed);
+}
+
+void FantomineAudioProcessor::timerCallback()
+{
+    for (int i = 0; i < kNumQueued; ++i)
+        if (pendingSet[i].exchange (false, std::memory_order_acquire))
+            if (auto* p = apvts.getParameter (queuedId (i)))
+                p->setValueNotifyingHost (p->convertTo0to1 (pendingValue[i].load (std::memory_order_relaxed)));
+}
+
 void FantomineAudioProcessor::footswitchDown()
 {
     if (footswitchPressed.exchange (true)) return;
@@ -178,10 +220,10 @@ void FantomineAudioProcessor::footswitchUp()
     if (longPressFired.load()) return;   // l'appui long a déjà agi
 
     // appui court : sort du HOLD s'il est actif, sinon bascule le bypass
-    if (pHold->load() > 0.5f)
-        setParam ("hold", 0.0f);
+    if (queuedOrCurrent ("hold", pHold) > 0.5f)
+        setParamQueued ("hold", 0.0f);
     else
-        setParam ("bypass", pBypass->load() > 0.5f ? 0.0f : 1.0f);
+        setParamQueued ("bypass", queuedOrCurrent ("bypass", pBypass) > 0.5f ? 0.0f : 1.0f);
 }
 
 void FantomineAudioProcessor::checkLongPress()
@@ -191,8 +233,8 @@ void FantomineAudioProcessor::checkLongPress()
     if (juce::Time::getMillisecondCounterHiRes() - t0 >= kLongPressMs)
     {
         longPressFired.store (true);
-        if (pBypass->load() > 0.5f) setParam ("bypass", 0.0f);   // HOLD rallume la pédale
-        setParam ("hold", pHold->load() > 0.5f ? 0.0f : 1.0f);
+        if (queuedOrCurrent ("bypass", pBypass) > 0.5f) setParamQueued ("bypass", 0.0f);   // HOLD rallume la pédale
+        setParamQueued ("hold", queuedOrCurrent ("hold", pHold) > 0.5f ? 0.0f : 1.0f);
     }
 }
 
@@ -232,8 +274,7 @@ void FantomineAudioProcessor::handleMidi (const juce::MidiBuffer& midi, int)
         static const char* ids[kNumTargets] = { nullptr, "whammy", "vibrato", "speed", "blend" };
         for (int t = kOctave; t < kNumTargets; ++t)
             if (cc == targetCC[(size_t) t].load())
-                if (auto* prm = apvts.getParameter (ids[t]))
-                    prm->setValueNotifyingHost (v);   // le potard (ou le levier) suit la pédale
+                setParamQueued (ids[t], v);           // le potard (ou le levier) suit la pédale (plages 0..1)
 
         if (cc == footswitchCC.load())
         {
@@ -312,16 +353,15 @@ void FantomineAudioProcessor::processBlock (juce::AudioBuffer<float>& buffer, ju
     uiAmp.store ((float) engine.displayAmp);
     uiNote.store (engine.noteDetected);
     uiExpression.store (params.expression);
-    {
-        const juce::SpinLock::ScopedTryLockType lock (harmLock);
-        if (lock.isLocked()) harmonics = engine.getHarmonics();
-    }
+    const auto& h = engine.getHarmonics();
+    for (size_t i = 0; i < harmonics.size(); ++i) harmonics[i].store ((float) h[i], std::memory_order_relaxed);
 }
 
 std::array<double, 12> FantomineAudioProcessor::getHarmonicsSnapshot() const
 {
-    const juce::SpinLock::ScopedLockType lock (harmLock);
-    return harmonics;
+    std::array<double, 12> out {};
+    for (size_t i = 0; i < out.size(); ++i) out[i] = (double) harmonics[i].load (std::memory_order_relaxed);
+    return out;
 }
 
 //==============================================================================

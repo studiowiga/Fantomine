@@ -86,3 +86,7 @@ Alternative sans routage : **Param → Learn** dans la fenêtre FX de Reaper sur
 paramètres `Expression`, `Octave Whammy`, `Vibrato`, `Speed`, `Blend`, `Bypass`, `Hold`.
 
 Manuel complet (anglais puis français) : `Fantomine_Manual_EN_FR.pdf`.
+
+## Versions
+
+- v1.2.0 : anti-gel v2 (JUCE 9.0.4 conservé, caches refaits par le timer, chien de garde, aucun appel à l'hôte depuis le thread audio)

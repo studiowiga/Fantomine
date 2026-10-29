@@ -210,7 +210,10 @@ void GhostDisplay::tick (float dt)
     // Éteint (bypass), paint() ne dessine rien : un dernier redessin pour effacer, puis plus rien.
     const float on = lights.power;
     if (on >= 0.01f || drawnPower >= 0.01f)
-        repaint();
+    {
+        if (auto* pv = dynamic_cast<PedalView*> (getParentComponent())) pv->askRepaint (getBounds());   // suivi du chien de garde
+        else repaint();
+    }
     drawnPower = on;
 }
 
@@ -482,10 +485,33 @@ void PedalView::sliderValueChanged (juce::Slider* s)
 
 void PedalView::sliderDragStarted (juce::Slider* s) { sliderValueChanged (s); }
 
+void PedalView::askRepaint (juce::Rectangle<int> r)
+{
+    if (repaintAskedMs <= 0.0) repaintAskedMs = juce::Time::getMillisecondCounterHiRes();
+    repaint (r);
+}
+
+// fond mis à l'échelle exacte de l'écran : appelé par le timer de l'éditeur, jamais par paint()
+void PedalView::rebuildCache (float px)
+{
+    const int tw = juce::jlimit (64, ui::kW * 3, (int) std::lround (ui::kW * px));
+    const int th = juce::jlimit (48, ui::kH * 3, (int) std::lround (ui::kH * px));
+    if (bgCache.isValid() && bgCache.getWidth() == tw && bgCache.getHeight() == th) return;
+    bgCache = (tw >= background.getWidth()) ? background : background.rescaled (tw, th, juce::Graphics::highResamplingQuality);
+    repaint();
+}
+
 void PedalView::paint (juce::Graphics& g)
 {
+    lastPaintMs = juce::Time::getMillisecondCounterHiRes();
+    repaintAskedMs = 0.0;
+    g.fillAll (juce::Colours::black);
+    // anti-gel : aucun rescale ici, on dessine le cache existant (ou l'original en attendant le timer)
+    const auto& bg = bgCache.isValid() ? bgCache : background;
+    g.setImageResamplingQuality (juce::Graphics::mediumResamplingQuality);
+    g.drawImageTransformed (bg, juce::AffineTransform::scale ((float) ui::kW / (float) bg.getWidth(),
+                                                              (float) ui::kH / (float) bg.getHeight()));
     g.setImageResamplingQuality (juce::Graphics::highResamplingQuality);
-    g.drawImageAt (background, 0, 0);
 
     // néon du titre
     if (lights.title > 0.005f)
@@ -565,7 +591,7 @@ void PedalView::tick (float dt)
     if (std::abs (press - footswitch.pressAnim) > 0.001f)
     {
         footswitch.pressAnim += (press - footswitch.pressAnim) * juce::jmin (1.0f, dt * 30.0f);
-        footswitch.repaint();
+        askRepaint (footswitch.getBounds());
     }
     // levier : 3 positions, ou suivi continu quand une pédale le pilote (whammy)
     const bool whammy = proc.whammyActive.load();
@@ -574,7 +600,7 @@ void PedalView::tick (float dt)
     if (std::abs (op - octave->anim) > 0.001f)
     {
         octave->anim += (op - octave->anim) * juce::jmin (1.0f, dt * (whammy ? 30.0f : 22.0f));
-        octave->repaint();
+        askRepaint (octave->getBounds());
     }
     if (whammy && std::abs (oct - lastOct) > 0.004f)
         setStatus ("OCTAVE  " + juce::String (oct >= 0 ? "+" : "") + juce::String (oct * 12.0f, 1) + " st");
@@ -583,7 +609,7 @@ void PedalView::tick (float dt)
     // les potards ne se redessinent que pendant un fondu
     if (std::abs (lastPower - lights.power) > 0.0005f)
     {
-        for (auto* k : { &glide, &range, &tone, &vibrato, &speed, &blend }) k->repaint();
+        for (auto* k : { &glide, &range, &tone, &vibrato, &speed, &blend }) askRepaint (k->getBounds());
         lastPower = lights.power;
     }
 
@@ -591,9 +617,9 @@ void PedalView::tick (float dt)
     auto changed = [] (float& drawn, float now) { if (std::abs (drawn - now) < 0.002f) return false; drawn = now; return true; };
 
     if (changed (drawnTitle, lights.title))
-        repaint (kTitlePos.x, kTitlePos.y, titleOn.getWidth(), titleOn.getHeight());
+        askRepaint ({ kTitlePos.x, kTitlePos.y, titleOn.getWidth(), titleOn.getHeight() });
     if (changed (drawnLed, lights.led))
-        repaint (kLedPos.x, kLedPos.y, ledOn.getWidth(), ledOn.getHeight());
+        askRepaint ({ kLedPos.x, kLedPos.y, ledOn.getWidth(), ledOn.getHeight() });
 
     const juce::String st = currentStatusText();
     const bool bypassed = isBypassed (proc);
@@ -602,7 +628,7 @@ void PedalView::tick (float dt)
         statusDrawnOnce = true;
         drawnStatus = st;
         drawnStatusBypass = bypassed;
-        repaint (kStatus);
+        askRepaint (kStatus);
     }
 }
 
@@ -726,7 +752,9 @@ FantomineAudioProcessorEditor::FantomineAudioProcessorEditor (FantomineAudioProc
     setResizeLimits (minW, (int) std::lround ((double) minW * ui::kH / ui::kW),
                      ui::kMaxW, (int) std::lround ((double) ui::kMaxW * ui::kH / ui::kW));
     getConstrainer()->setFixedAspectRatio ((double) ui::kW / (double) ui::kH);
+    setOpaque (true);                      // anti-gel : l'hôte ne redessine jamais ce qui est derrière la fenêtre
     setScaleIndex (savedIdx);
+    rebuildCaches();
 
     lastTick = juce::Time::getMillisecondCounterHiRes();
     startTimerHz (30);
@@ -738,10 +766,21 @@ FantomineAudioProcessorEditor::~FantomineAudioProcessorEditor() { stopTimer(); }
 // Anti-gel de la fenêtre (Windows) : JUCE 8+ dessine par défaut avec Direct2D (carte graphique).
 // Avec certains pilotes (Intel notamment) la fenêtre du plugin cesse de se rafraîchir alors que
 // le DAW continue de tourner. Le moteur logiciel est stable partout et largement assez rapide ici.
+//
+// Anti-gel v2 (Studio Wiga) :
+//  1. moteur de rendu logiciel forcé sur Windows, appliqué à chaque nouvelle fenêtre hôte (peer)
+//     et revérifié toutes les secondes, jamais en boucle ;
+//  2. aucun calcul lourd dans paint() : le fond mis à l'échelle est refait par le timer seulement,
+//     après stabilisation de la taille ou quand l'échelle d'affichage change (au plus toutes les 250 ms) ;
+//  3. chien de garde : si un redessin demandé n'est pas arrivé au bout de 1,5 s alors que la fenêtre
+//     est visible, le moteur de rendu est réappliqué et toute la fenêtre est redessinée ;
+//  4. côté audio : aucun appel à l'hôte ni verrou partagé depuis le thread audio (voir PluginProcessor).
 void FantomineAudioProcessorEditor::useSoftwareRenderer()
 {
+    auto* peer = getPeer();
+    if (peer != lastPeer) { lastPeer = peer; repaint(); }
    #if JUCE_WINDOWS
-    if (auto* peer = getPeer())
+    if (peer != nullptr)
     {
         int sw = peer->getAvailableRenderingEngines().indexOf ("Software Renderer");
         if (sw < 0) sw = 0;
@@ -751,16 +790,29 @@ void FantomineAudioProcessorEditor::useSoftwareRenderer()
    #endif
 }
 
-void FantomineAudioProcessorEditor::parentHierarchyChanged()
+void FantomineAudioProcessorEditor::parentHierarchyChanged() { useSoftwareRenderer(); }
+void FantomineAudioProcessorEditor::visibilityChanged()      { useSoftwareRenderer(); if (isShowing()) repaint(); }
+
+float FantomineAudioProcessorEditor::physicalScale() const
 {
-    useSoftwareRenderer();
+    return juce::jlimit (1.0f, 4.0f, (float) juce::Component::getApproximateScaleFactorForComponent (this));
+}
+
+void FantomineAudioProcessorEditor::rebuildCaches (float sc)
+{
+    if (sc <= 0.0f) sc = cacheScale > 0.0f ? cacheScale : physicalScale();
+    if (getWidth() <= 0) return;
+    cacheW = getWidth(); cacheScale = sc;
+    pedal.rebuildCache ((float) getWidth() / (float) ui::kW * sc);
 }
 
 void FantomineAudioProcessorEditor::resized()
 {
+    // anti-gel : jamais de setSize ici, les limites du constrainer suffisent
     const float s = (float) getWidth() / (float) ui::kW;
     pedal.setTransform (juce::AffineTransform::scale (s));
     pedal.setBounds (0, 0, ui::kW, ui::kH);
+    resizeSettle = 4;              // le fond sera refait par le timer quand la taille ne bouge plus
 }
 
 int FantomineAudioProcessorEditor::getScaleIndex() const
@@ -785,6 +837,28 @@ void FantomineAudioProcessorEditor::timerCallback()
     const double now = juce::Time::getMillisecondCounterHiRes();
     const float dt = (float) juce::jlimit (0.0, 0.1, (now - lastTick) / 1000.0);
     lastTick = now;
-    useSoftwareRenderer();   // au cas où la fenêtre a été recréée par l'hôte (changement d'écran, d'échelle…)
+
+    // moteur logiciel : seulement si la fenêtre hôte a changé, ou au plus une fois par seconde
+    if (getPeer() != lastPeer || now - lastRendererCheckMs > 1000.0) { lastRendererCheckMs = now; useSoftwareRenderer(); }
+
+    // caches : reconstruits ici seulement (jamais dans paint)
+    if (resizeSettle > 0 && --resizeSettle == 0) rebuildCaches();
+    else if (resizeSettle == 0 && now - lastScaleCheckMs > 250.0)
+    {
+        lastScaleCheckMs = now;
+        const float sc = physicalScale();
+        if (std::abs (sc - cacheScale) > 0.01f) rebuildCaches (sc);
+    }
+
+    // chien de garde : un redessin demandé n'arrive pas -> on relance le moteur de rendu et on redessine tout
+    if (pedal.repaintAskedMs > 0.0 && isShowing() && now - pedal.repaintAskedMs > 1500.0 && pedal.lastPaintMs < pedal.repaintAskedMs)
+    {
+        pedal.repaintAskedMs = 0.0;
+        lastPeer = nullptr;
+        useSoftwareRenderer();
+        repaint();
+        pedal.repaint();
+    }
+
     pedal.tick (dt);
 }

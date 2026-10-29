@@ -14,7 +14,8 @@ struct FactoryPreset
 
 //==============================================================================
 class FantomineAudioProcessor : public juce::AudioProcessor,
-                                private juce::AudioProcessorValueTreeState::Listener
+                                private juce::AudioProcessorValueTreeState::Listener,
+                                private juce::Timer
 {
 public:
     FantomineAudioProcessor();
@@ -117,12 +118,21 @@ private:
     std::atomic<bool> longPressFired { false };
     void setParam (const char* id, float plainValue);
 
+    // Anti-gel v2 (Studio Wiga) : valeurs demandées depuis le thread audio (MIDI, footswitch MIDI),
+    // transmises à l'hôte par le timer du processeur (60 Hz, thread message)
+    void timerCallback() override;
+    static constexpr int kNumQueued = 6;
+    static const char* queuedId (int i);
+    void setParamQueued (const char* id, float plainValue);
+    float queuedOrCurrent (const char* id, const std::atomic<float>* current) const;
+    std::atomic<float> pendingValue[kNumQueued];
+    std::atomic<bool>  pendingSet[kNumQueued];
+
     // bypass en fondu
     juce::SmoothedValue<float> wetGain;
     juce::AudioBuffer<float> monoIn, monoOut;
 
-    std::array<double, 12> harmonics {};
-    juce::SpinLock harmLock;
+    std::array<std::atomic<float>, 12> harmonics {};   // pas de verrou partagé audio / interface (anti-gel v2)
 
     std::atomic<bool> applyingPreset { false };
     int currentProgram = 0;
