@@ -70,8 +70,8 @@ pédale n'envoie pas 0 pile au repos. Toucher le levier OCTAVE à la souris le r
 Les paramètres `Octave Whammy` et `Whammy Range` sont aussi automatisables
 depuis Reaper.
 
-Clic droit sur la pédale : taille de la fenêtre (comme Ring Think : 67 % par défaut
-= 661 × 495 px, aussi taille minimale ; 75 % ; 100 %),
+Clic droit sur la pédale : taille de la fenêtre (comme Ring Think : 60 % par défaut,
+aussi taille minimale ; 75 % ; 100 %),
 pédales d'expression MIDI (CC 14 bits accepté pour PITCH), plage de la whammy,
 footswitch MIDI (MIDI Learn), sens de la pédale de hauteur.
 
@@ -85,7 +85,7 @@ footswitch MIDI (MIDI Learn), sens de la pédale de hauteur.
 Alternative sans routage : **Param → Learn** dans la fenêtre FX de Reaper sur les
 paramètres `Expression`, `Octave Whammy`, `Vibrato`, `Speed`, `Blend`, `Bypass`, `Hold`.
 
-Manuel complet (anglais puis français) : `Fantomine_Manual_EN_FR.pdf`.
+Manuel complet (anglais puis français) : `docs/Fantomine_Manual_EN-FR_v1.3.0.pdf`.
 
 ## Versions
 
