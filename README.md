@@ -95,3 +95,4 @@ Manuel complet (anglais puis français) : `docs/Fantomine_Manual_EN-FR_v1.3.0.pd
 
 - v1.3.0 : MIDI Learn au clic droit sur chaque commande (Clear MIDI, assignations sauvegardées avec le projet)
 - v1.3.1 : « Invert MIDI pedal direction » (clic droit) pour les pédales d'expression PITCH et OCTAVE, activé par défaut comme sur Crycat et Wharry
+- v1.3.2 : suivi de hauteur quand les notes précédentes sonnent encore (autre corde) : la voix suit la dernière note jouée au lieu de rester sur l'ancienne ou de tomber sur une note fantôme grave ; détection d'attaque insensible aux battements des cordes graves
