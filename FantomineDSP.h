@@ -89,15 +89,10 @@ public:
         minWindow  = (int) std::lround (dsr * 0.010);          // 10 ms minimum juste après l'attaque
         hop        = std::max (8, (int) std::lround (dsr * 0.003)); // une analyse toutes les 3 ms
 
-        // + 2 périodes max d'historique : les peignes qui retirent les notes précédentes lisent avant la fenêtre
-        ring.assign ((size_t) (windowSize + 4 * maxTau + 32), 0.0f);
+        ring.assign ((size_t) (windowSize + maxTau + 16), 0.0f);
         diff.assign ((size_t) maxTau + 2, 0.0f);
         raw.assign ((size_t) maxTau + 2, 0.0f);
         frame.assign (ring.size(), 0.0f);
-        cframe.assign (ring.size(), 0.0f);
-        for (int r = 0; r < kRefs; ++r) { refTau[r] = 0.0; refAge[r] = 0; }
-        candTau = 0.0; candCount = 0;
-        refLife = (int) (3.0 * dsr);
         writePos = 0; counter = 0; hopCounter = 0;
         hist[0] = hist[1] = hist[2] = 0.0;
         histCount = 0;
@@ -107,10 +102,6 @@ public:
         onsetHP2.setHighpass (sampleRate, 1500.0, 0.707);
         onsetHP.reset(); onsetHP2.reset();
         fastC = std::exp (-1.0 / (0.004 * sampleRate));
-        broadEnv = 0.0; broadC = std::exp (-1.0 / (0.150 * sampleRate));
-        blockLen = std::max (1, (int) std::lround (0.001 * sampleRate));
-        for (auto& b : blockHist) b = 0.0f;
-        blockPos = 0; blockCount = 0; blockMax = 0.0; prevPeak = 0.0;
         slowC = std::exp (-1.0 / (0.060 * sampleRate));
         sinceOnset = 1 << 30; refractory = (int) (0.050 * sampleRate);   // compté en échantillons pleine fréquence
         onsetFlag = false;
@@ -123,28 +114,10 @@ public:
         // les aigus ne « pulsent » pas avec les notes graves, contrairement à l'enveloppe large bande
         const double h = std::abs (onsetHP2.process (onsetHP.process (x)));
         fastEnv = h > fastEnv ? h : fastC * fastEnv + (1.0 - fastC) * h;
-        // niveau large bande : sert de plancher (les aigus résiduels des cordes qui sonnent sont minuscules)
-        const double ax = std::abs (x);
-        broadEnv = ax > broadEnv ? ax : broadC * broadEnv + (1.0 - broadC) * ax;
-        // référence = crête des aigus sur les 5..45 ms précédentes. Une corde grave a des pointes d'aigus
-        // à chaque période et ses battements avec une autre corde font monter/descendre ces pointes :
-        // comparer à la crête récente (et non à une moyenne) évite les fausses attaques à répétition.
-        blockMax = std::max (blockMax, fastEnv);
-        if (++blockCount >= blockLen)
-        {
-            blockHist[(size_t) blockPos] = (float) blockMax;
-            blockPos = (blockPos + 1) % kBlocks;
-            blockCount = 0; blockMax = 0.0;
-            float m = 0.0f;
-            for (int b = kRecentBlocks; b < kBlocks; ++b) m = std::max (m, blockHist[(size_t) ((blockPos - 1 - b + 2 * kBlocks) % kBlocks)]);
-            prevPeak = m;
-        }
+        slowEnv = slowC * slowEnv + (1.0 - slowC) * h;
         if (sinceOnset < (1 << 30)) ++sinceOnset;
-        if (sinceOnset > refractory && fastEnv > 1.8 * prevPeak + std::max (2.0e-4, 0.01 * broadEnv))
+        if (sinceOnset > refractory && fastEnv > 3.0 * slowEnv + 2.0e-4)
         {
-           #ifdef FANTO_DEBUG
-            if (fantoDebug) printf ("   ONSET fast=%.5f prev=%.5f broad=%.4f\n", fastEnv, prevPeak, broadEnv);
-           #endif
             sinceOnset = 0;
             histCount = 0;            // l'ancienne note ne vote plus dans la médiane
             onsetFlag = true;
@@ -156,8 +129,6 @@ public:
 
         ring[(size_t) writePos] = (float) y;
         writePos = (writePos + 1) % (int) ring.size();
-        for (int r = 0; r < kRefs; ++r)
-            if (refTau[r] > 0.0 && ++refAge[r] > refLife) refTau[r] = 0.0;   // corde éteinte depuis longtemps
 
         if (++hopCounter < hop) return false;
         hopCounter = 0;
@@ -171,52 +142,6 @@ public:
     bool   takeOnset()          { const bool o = onsetFlag; onsetFlag = false; return o; }
 
 private:
-    // lecture du tampon circulaire à une position fractionnaire (Lagrange 4 points)
-    inline float ringAt (double pos) const
-    {
-        const int N = (int) ring.size();
-        const int i = (int) std::floor (pos);
-        const float t = (float) (pos - i);
-        auto at = [this, N] (int k) { k %= N; if (k < 0) k += N; return ring[(size_t) k]; };
-        const float ym1 = at (i - 1), y0 = at (i), y1 = at (i + 1), y2 = at (i + 2);
-        const float c1 = y1 - ym1 * (1.0f / 3.0f) - y0 * 0.5f - y2 * (1.0f / 6.0f);
-        const float c2 = 0.5f * (ym1 + y1) - y0;
-        const float c3 = (y2 - ym1) * (1.0f / 6.0f) + 0.5f * (y0 - y1);
-        return ((c3 * t + c2) * t + c1) * t + y0;
-    }
-
-    // période exacte de la note qui sonnait juste avant l'attaque : minimise le résidu du peigne
-    // (une erreur d'un quart d'échantillon laisse passer les harmoniques aigus de l'ancienne note)
-    double residual (double tau, int len) const
-    {
-        double e = 0.0;
-        for (int i = 0; i < len; ++i)
-        {
-            const double p = (double) (writePos - 1 - i);
-            const float d = ringAt (p) - ringAt (p - tau);
-            e += (double) d * d;
-        }
-        return e;
-    }
-    double refinePeriod (double tau) const
-    {
-        const int len = std::min (windowSize, (int) ring.size() - (int) (3.0 * tau) - 8);
-        if (len < 32) return tau;
-        double step = 0.4;
-        for (int it = 0; it < 4; ++it)
-        {
-            const double a = residual (tau - step, len), b = residual (tau, len), c = residual (tau + step, len);
-            const double den = a - 2.0 * b + c;
-            double off = den > 1e-12 ? 0.5 * (a - c) / den : (a < c ? -1.0 : 1.0);
-            off = std::clamp (off, -1.0, 1.0);
-            tau += off * step;
-            step *= 0.35;
-        }
-        return tau;
-    }
-
-    struct YinResult { int status = 0; double tau = 0.0, d = 1.0; };   // 0 trop tôt, 1 pas de hauteur, 2 trouvée
-
     void analyse()
     {
         const int N = (int) ring.size();
@@ -248,193 +173,13 @@ private:
         if (energy / (W + tauLim) < 1.0e-7)          // silence : on oublie la note
         {
             detected = false; confidence = 0.0; histCount = 0;
-            for (auto& r : refTau) r = 0.0;
-            candCount = 0;
             return;
         }
 
-        YinResult res = yin (frame.data(), W, tauLim, true);
-
-        // Les cordes jouées avant sonnent souvent encore : le mélange donne l'ancienne note ou une
-        // « note fantôme » plus grave (période commune). Un peigne x[n] - x[n - T] (T = période de
-        // l'ancienne note) l'efface sans changer la période de la nouvelle note : on analyse aussi ce signal.
-        if (refTau[0] > 0.0)
-        {
-            // peigne en cascade : (1 - z^-T0)(1 - z^-T1) développé en 4 lectures signées
-            double offs[1 << kRefs]; float sgn[1 << kRefs]; int nOff = 0;
-            offs[nOff] = 0.0; sgn[nOff++] = 1.0f;
-            for (int r = 0; r < kRefs; ++r)
-                if (refTau[r] > 0.0)
-                    for (int j = 0, n0 = nOff; j < n0; ++j) { offs[nOff] = offs[j] + refTau[r]; sgn[nOff++] = -sgn[j]; }
-
-            // juste après l'attaque, la nouvelle note n'a pas encore d'« écho » dans le peigne :
-            // on n'analyse que ce qui suit l'attaque d'au moins le plus long retard du peigne
-            const int combLag = (int) std::ceil (offs[nOff - 1]) + 1;
-            int usableC = usable;
-            if (since < full + skip + combLag) usableC = since - skip - combLag;
-            const int tauLimC = std::min (tauLim, usableC - minWindow);
-            const int WC = std::min (W, usableC - tauLimC);
-            const bool combReady = tauLimC >= minTau + 2 && WC >= minWindow;
-            const int startC = (W + tauLim) - (WC + tauLimC);           // décalage dans la trame
-
-            double cEnergy = 0.0, eSub = 0.0;
-            if (combReady)
-                for (int i = startC; i < W + tauLim; ++i)
-                {
-                    const double p = (double) (start + i);
-                    float v = frame[(size_t) i];
-                    for (int j = 1; j < nOff; ++j) v += sgn[j] * ringAt (p - offs[j]);
-                    cframe[(size_t) (i - startC)] = v;
-                    cEnergy += (double) v * v;
-                    eSub += (double) frame[(size_t) i] * frame[(size_t) i];
-                }
-            // énergie de référence : celle que le peigne laisse passer en moyenne (gain ~ 2 par étage)
-            const double cRef = eSub * (double) (nOff);
-
-           #ifdef FANTO_DEBUG
-            if (fantoDebug) printf ("   since=%d usableC=%d ready=%d raw st=%d m=%.2f E=%.4f\n", since, usableC, (int) combReady, res.status, res.tau>0?hzToMidi(dsr/res.tau):0, combReady ? cEnergy/cRef : -1.0);
-           #endif
-            if (! combReady)
-            {
-                if (res.status == 2 && (isRef (res.tau) || isMultipleOfRef (res.tau))) return;   // on attend de pouvoir trancher
-            }
-            else
-            {
-                // pas de correction « octave en dessous » ici : le peigne creuse justement certains harmoniques
-                YinResult c = cEnergy > 1.0e-4 * cRef ? yin (cframe.data(), WC, tauLimC, false) : YinResult { 1, 0.0, 1.0 };
-               #ifdef FANTO_DEBUG
-                if (fantoDebug) printf ("   raw st=%d m=%.2f d=%.2f | comb(%.2f %.2f) st=%d m=%.2f d=%.2f E=%.4f\n", res.status, res.tau>0?hzToMidi(dsr/res.tau):0, res.d,
-                                        hzToMidi(dsr/refTau[0]), refTau[1]>0?hzToMidi(dsr/refTau[1]):0, c.status, c.tau>0?hzToMidi(dsr/c.tau):0, c.d, cEnergy/cRef);
-               #endif
-                const bool cNew   = c.status == 2 && c.d < 0.22 && ! isRef (c.tau) && ! isMultipleOfRef (c.tau);
-                const bool rawNew = res.status == 2 && res.d < 0.08 && ! isRef (res.tau) && ! isMultipleOfRef (res.tau);
-                if (cNew)
-                    res = c;                                     // une note nouvelle se dégage sous les cordes qui sonnent
-                else if (rawNew)
-                    ;                                            // note seule bien nette (ex. octave d'une note déjà jouée)
-                else if (c.status == 0)
-                    return;                                      // la nouvelle note n'est pas encore mesurable
-                else
-                {
-                    // rien de nouveau : seules les notes déjà jouées sonnent (note rejouée, attaque parasite)
-                    // -> la note en cours, ou la corde qu'on vient de rejouer ; jamais la période commune des cordes
-                    double pick = refTau[0];
-                    if (since < (int) (0.15 * dsr))
-                        pick = replucked (start + startC, (W + tauLim) - startC, start + (W + tauLim) - since);
-                    res.status = 2; res.tau = pick; res.d = 0.1;
-                }
-            }
-        }
-
-        if (res.status == 0) return;
-        if (res.status == 1) { confidence *= 0.6; if (confidence < 0.2) detected = false; return; }
-
-        const double m = hzToMidi (dsr / res.tau);
-        const double c = 1.0 - res.d;
-        trackStable (res.tau);
-       #ifdef FANTO_DEBUG
-        if (fantoDebug) printf ("      [W=%d lim=%d tau=%.2f d'=%.3f m=%.2f path=%d]\n", W, tauLim, res.tau, res.d, m, dbgPath);
-       #endif
-
-        // médiane sur 3 analyses pour rejeter les erreurs isolées
-        hist[2] = hist[1]; hist[1] = hist[0]; hist[0] = m;
-        histCount = std::min (3, histCount + 1);
-        double med = m;
-        if (histCount == 3)
-        {
-            const double a = hist[0], b = hist[1], d = hist[2];
-            med = std::max (std::min (a, b), std::min (std::max (a, b), d));
-            if (std::abs (m - med) < 0.5) med = m;   // note stable : on garde la plus récente
-        }
-
-        midi = med;
-        confidence = c;
-        detected = true;
-    }
-
-    // note en cours = période stable 12 ms ; quand elle change, l'ancienne devient une note « qui sonne encore »
-    void trackStable (double tau)
-    {
-        if (candTau > 0.0 && std::abs (tau - candTau) < 0.03 * candTau) ++candCount;
-        else { candTau = tau; candCount = 1; }
-        if (candCount < 4) return;
-
-        if (refTau[0] > 0.0 && std::abs (candTau - refTau[0]) < 0.03 * refTau[0])
-        {
-            refAge[0] = 0;                                                   // elle sonne toujours
-            if (candCount % 8 == 0) refTau[0] = refinePeriod (tau);          // suit le bend / la justesse qui bouge
-            return;
-        }
-        if (candCount != 4) return;
-        double nt[kRefs + 1]; int na[kRefs + 1]; int n = 0;
-        nt[n] = refinePeriod (candTau); na[n++] = 0;
-        for (int r = 0; r < kRefs; ++r)
-            if (refTau[r] > 0.0 && std::abs (refTau[r] - nt[0]) > 0.03 * nt[0]) { nt[n] = refTau[r]; na[n++] = refAge[r]; }
-        for (int r = 0; r < kRefs; ++r) { refTau[r] = r < n ? nt[r] : 0.0; refAge[r] = r < n ? na[r] : 0; }
-       #ifdef FANTO_DEBUG
-        if (fantoDebug) printf ("   NOTE %.2f (avant %.2f)\n", hzToMidi (dsr / refTau[0]), refTau[1] > 0 ? hzToMidi (dsr / refTau[1]) : 0.0);
-       #endif
-    }
-
-    // Juste après une attaque, sans note nouvelle : quelle corde déjà connue vient d'être rejouée ?
-    // Celle dont l'énergie augmente le plus entre avant et après l'attaque (les autres ne font que s'éteindre).
-    // Énergie d'une composante r ~ E(x) - E(x - x[n - Tr]) / 2.
-    double compEnergy (int from, int len, double tau) const
-    {
-        double ex = 0.0, ec = 0.0;
-        for (int i = 0; i < len; ++i)
-        {
-            const double p = (double) (from + i);
-            const float x = ringAt (p);
-            const float c = x - ringAt (p - tau);
-            ex += (double) x * x; ec += (double) c * c;
-        }
-        return std::max (0.0, ex - 0.5 * ec) / std::max (1, len);
-    }
-    double replucked (int postStart, int postLen, int onsetPos) const
-    {
-        const int preLen = std::min (postLen, std::max (32, windowSize / 2));
-        auto total = [this] (int from, int len)
-        {
-            double e = 0.0;
-            for (int i = 0; i < len; ++i) { const float x = ringAt ((double) (from + i)); e += (double) x * x; }
-            return e / std::max (1, len);
-        };
-        const double postTot = total (postStart, postLen), preTot = total (onsetPos - preLen, preLen);
-        double best = refTau[0], bestGain = -1.0;
-        for (int r = 0; r < kRefs; ++r)
-        {
-            if (refTau[r] <= 0.0) continue;
-            const double post = compEnergy (postStart, postLen, refTau[r]);
-            if (post < 0.15 * postTot) continue;                          // corde étouffée / éteinte
-            const double gain = post / (compEnergy (onsetPos - preLen, preLen, refTau[r]) + 0.1 * preTot + 1.0e-12);
-            if (gain > bestGain) { bestGain = gain; best = refTau[r]; }
-        }
-        return best;
-    }
-
-    bool isMultipleOfRef (double tau) const
-    {
-        for (double r : refTau)
-            if (r > 0.0)
-                for (int k = 2; k <= 6; ++k)
-                    if (std::abs (tau - k * r) < 0.02 * k * r) return true;
-        return false;
-    }
-
-    bool isRef (double tau) const
-    {
-        for (double r : refTau)
-            if (r > 0.0 && std::abs (tau - r) < 0.03 * r) return true;
-        return false;
-    }
-
-    // YIN sur une trame (W + tauLim échantillons)
-    YinResult yin (const float* f, int W, int tauLim, bool allowLower)
-    {
-        YinResult out;
+        // fonction de différence (YIN étape 2) + normalisation cumulée (étape 3)
         diff[0] = 1.0f;
         double running = 0.0;
+        const float* f = frame.data();
         for (int tau = 1; tau <= tauLim; ++tau)
         {
             // 4 accumulateurs indépendants : le compilateur peut vectoriser sans -ffast-math
@@ -484,17 +229,16 @@ private:
             int g = minTau;
             for (int tau = minTau + 1; tau < tauLim; ++tau)
                 if (diff[(size_t) tau] < diff[(size_t) g]) g = tau;
-            if (diff[(size_t) g] > 0.40f || W < windowSize / 2) { out.status = 1; return out; }
+            if (diff[(size_t) g] > 0.40f || W < windowSize / 2) { confidence *= 0.6; if (confidence < 0.2) detected = false; return; }
             // préfère le plus petit sous-multiple presque aussi bon (évite l'octave en dessous)
             best = g;
             for (int k = 4; k >= 2; --k)
             {
-                if (g / k <= minTau) continue;
                 const int t = localMin (std::max (minTau, (int) std::lround ((double) g / k)));
                 if (std::abs (t * k - g) <= 2 + g / 40 && diff[(size_t) t] < diff[(size_t) g] + 0.06f) { best = t; break; }
             }
         }
-        else if (allowLower)
+        else
         {
             // fondamental faible (micro chevalet) : si 2τ est nettement meilleur, la vraie période est 2τ
             for (int k = 2; k <= 3; ++k)
@@ -514,50 +258,50 @@ private:
             }
         }
 
-        // signal « peigné » : les restes des anciennes cordes créent des périodes communes très graves ;
-        // on garde le plus petit sous-multiple encore bien périodique (la vraie nouvelle note)
-        if (! allowLower)
-            for (int k = 6; k >= 2; --k)
-            {
-                if (best / k <= minTau) continue;
-                const int t = localMin (std::max (minTau, (int) std::lround ((double) best / k)));
-                if (std::abs (t * k - best) <= 2 + best / 40 && diff[(size_t) t] < std::max (0.30f, diff[(size_t) best] + 0.15f)) { best = t; break; }
-            }
-
         // trop tôt pour exclure une période deux fois plus longue : on attend un peu plus de signal
-        if (best * 2 > tauLim && tauLim < maxTau && diff[(size_t) best] > 0.05f) { out.status = 0; return out; }
+        if (best * 2 > tauLim && tauLim < maxTau && diff[(size_t) best] > 0.05f) return;
 
         // interpolation parabolique (étape 5)
-        // (sur la différence brute : la normalisation cumulée décale le creux de quelques cents)
         double betterTau = best;
         if (best > 1 && best < tauLim - 1)
         {
-            const double s0 = raw[(size_t) best - 1], s1 = raw[(size_t) best], s2 = raw[(size_t) best + 1];
+            const double s0 = diff[(size_t) best - 1], s1 = diff[(size_t) best], s2 = diff[(size_t) best + 1];
             const double den = 2.0 * (2.0 * s1 - s2 - s0);
-            if (std::abs (den) > 1e-12) betterTau = best + std::clamp ((s2 - s0) / den, -1.0, 1.0);
+            if (std::abs (den) > 1e-12) betterTau = best + (s2 - s0) / den;
         }
-        out.status = 2; out.tau = betterTau; out.d = diff[(size_t) best];
-        return out;
+
+        const double m = hzToMidi (dsr / betterTau);
+        const double c = 1.0 - diff[(size_t) best];
+       #ifdef FANTO_DEBUG
+        if (fantoDebug) printf ("      [W=%d lim=%d best=%d d'=%.3f m=%.2f path=%d]\n", W, tauLim, best, diff[(size_t) best], m, dbgPath);
+       #endif
+
+        // médiane sur 3 analyses pour rejeter les erreurs isolées
+        hist[2] = hist[1]; hist[1] = hist[0]; hist[0] = m;
+        histCount = std::min (3, histCount + 1);
+        double med = m;
+        if (histCount == 3)
+        {
+            const double a = hist[0], b = hist[1], d = hist[2];
+            med = std::max (std::min (a, b), std::min (std::max (a, b), d));
+            if (std::abs (m - med) < 0.5) med = m;   // note stable : on garde la plus récente
+        }
+
+        midi = med;
+        confidence = c;
+        detected = true;
     }
 
     Biquad hp, lp1, lp2, onsetHP, onsetHP2;
     int decim = 4, windowSize = 384, minWindow = 72, maxTau = 363, minTau = 8, hop = 36;
     double dsr = 12000.0;
-    std::vector<float> ring, diff, raw, frame, cframe;
-    static constexpr int kRefs = 3;          // note en cours + 2 notes précédentes qui sonnent encore
-    double refTau[kRefs] {};                 // périodes en échantillons décimés (0 = aucune)
-    int refAge[kRefs] {}, refLife = 36000;
-    double candTau = 0.0; int candCount = 0;
+    std::vector<float> ring, diff, raw, frame;
     int writePos = 0, counter = 0, hopCounter = 0;
     double hist[3] {};
     int histCount = 0;
     bool detected = false;
     double midi = 0.0, confidence = 0.0;
-    double fastEnv = 0.0, slowEnv = 0.0, fastC = 0.0, slowC = 0.0, broadEnv = 0.0, broadC = 0.0;
-    static constexpr int kBlocks = 45, kRecentBlocks = 5;    // blocs de 1 ms
-    std::array<float, kBlocks> blockHist {};
-    int blockPos = 0, blockCount = 0, blockLen = 44;
-    double blockMax = 0.0, prevPeak = 0.0;
+    double fastEnv = 0.0, slowEnv = 0.0, fastC = 0.0, slowC = 0.0;
     int sinceOnset = 1 << 30, refractory = 540;
     bool onsetFlag = false;
    #ifdef FANTO_DEBUG
@@ -812,9 +556,6 @@ public:
         noteDetected = haveNote && voiceAmp > 0.01;
     }
 
-   #ifdef FANTO_DEBUG
-    void tracker_dbg (bool on) { tracker.fantoDebug = on; }
-   #endif
     // infos pour l'interface
     double displayMidi = 57.0, displayAmp = 0.0;
     bool   noteDetected = false;
